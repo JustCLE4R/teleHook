@@ -1,8 +1,8 @@
-<p align="center"><img src="pinglet.png" width="96" alt="Pinglet logo"></p>
+<p align="center"><img src="assets/favicon.svg" width="96" alt="teleHook logo"></p>
 
-# Pinglet
+# teleHook
 
-A minimal NestJS REST API that sends a Telegram message to the chat IDs supplied in each request.
+A minimal NestJS REST API that sends a Telegram message, optionally with files such as screenshots, graphs, logs or diagnostic reports, to the chat IDs supplied in each request.
 
 There is no database, no stored state and no authentication. Recipients come only from the request payload, and delivery results exist only in the response.
 
@@ -23,29 +23,31 @@ Then set `TELEGRAM_BOT_TOKEN` in `.env`. The `.env` file is git-ignored; only `.
 
 ## Configuration
 
-| Variable                      | Default  | Description                                     |
-| ----------------------------- | -------- | ----------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN`          | required | Bot token from @BotFather (`<bot id>:<secret>`) |
-| `PORT`                        | `3000`   | HTTP port                                       |
-| `MAX_RECIPIENTS_PER_REQUEST`  | `20`     | Maximum chat IDs per request (1–100)            |
-| `TELEGRAM_REQUEST_TIMEOUT_MS` | `10000`  | Timeout for each Telegram API call (1000–60000) |
-| `RATE_LIMIT_TTL_MS`           | `60000`  | Rate-limit window                               |
-| `RATE_LIMIT_MAX_REQUESTS`     | `10`     | Requests allowed per client IP per window       |
+| Variable                      | Default  | Description                                                                       |
+| ----------------------------- | -------- | --------------------------------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`          | required | Bot token from @BotFather (`<bot id>:<secret>`)                                   |
+| `PORT`                        | `3000`   | HTTP port                                                                         |
+| `MAX_RECIPIENTS_PER_REQUEST`  | `20`     | Maximum chat IDs per request (1–100)                                              |
+| `MAX_ATTACHMENTS_PER_REQUEST` | `5`      | Maximum files per request (1–10)                                                  |
+| `MAX_ATTACHMENT_SIZE_MB`      | `10`     | Maximum size of each file, in MB (1–50; Telegram accepts bot uploads up to 50 MB) |
+| `TELEGRAM_REQUEST_TIMEOUT_MS` | `10000`  | Timeout for each Telegram API call, including each file upload (1000–60000)       |
+| `RATE_LIMIT_TTL_MS`           | `60000`  | Rate-limit window                                                                 |
+| `RATE_LIMIT_MAX_REQUESTS`     | `10`     | Requests allowed per client IP per window                                         |
 
 Variables are validated at startup. If one is missing or invalid, the app exits with code 1 and a message naming the variable. The token value is never printed. Real environment variables take precedence over values in `.env`.
 
 ## Running
 
 ```bash
-npm run start:dev                       # development, restarts on file changes
-npm run build && npm run start:prod     # production build
+npm run dev                       # development, restarts on file changes
+npm run build && npm run prod     # production build
 ```
 
 ## API
 
 ### `POST /api/send`
 
-`Content-Type: application/json` is required.
+Send a JSON body for a text message, or a `multipart/form-data` body to [attach files](#attaching-files) to it.
 
 ```json
 {
@@ -63,16 +65,83 @@ npm run build && npm run start:prod     # production build
 - Unknown properties are rejected with 400.
 - Messages are sent without `parse_mode`, so HTML or Markdown in the text is delivered literally.
 
+### Attaching files
+
+Send the same fields as a `multipart/form-data` form, and attach each file in a field named `files`:
+
+```bash
+curl http://localhost:3000/api/send \
+  -F chat_ids=123456789,-1001234567890 \
+  -F "message=High CPU on web-1" \
+  -F files=@cpu.png \
+  -F files=@top.txt
+```
+
+| Field      | Rules                                                                                                                                                                 |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chat_ids` | As in JSON. Repeat the field for each chat, or list the IDs separated by commas. `chat_ids[]` fields also work.                                                       |
+| `message`  | As in JSON. Required, also when files are attached.                                                                                                                   |
+| `files`    | Optional. Up to `MAX_ATTACHMENTS_PER_REQUEST` files (default 5), one `files` field each. Each must be non-empty and at most `MAX_ATTACHMENT_SIZE_MB` (default 10 MB). |
+
+Each chat receives:
+
+1. **The message**, exactly as for a JSON request. It goes first, so the alert arrives even if an upload fails.
+2. **Each file, in upload order**, as a reply to the message and without a notification sound. The files stay attached to their alert in a busy chat, and each alert notifies once.
+   - JPEG and PNG images of up to 10 MB are sent as **photos**: shown inline, compressed by Telegram, with the file name as caption. If Telegram refuses an image as a photo, for example a very tall screenshot, it is sent as a file instead.
+   - Everything else, including other image formats, is sent as a **file**, unchanged, under its original name.
+
+The request is validated as a whole before anything is sent. An empty file, a file over the size limit, or too many files rejects the request, **message included**. Scripts should attach only non-empty files within the limit, as in the example below.
+
+curl tips:
+
+- `-F "files=@-;filename=ps.txt"` uploads standard input: `ps aux | curl ... -F "files=@-;filename=ps.txt"`.
+- `-F` treats a value starting with `@` or `<` as a file. Pass text from variables with `--form-string "message=$TEXT"`, or read the message from a file with `-F "message=<alert.txt"`.
+- Windows 10, and Windows Server 2019 and later, include `curl.exe`. Windows PowerShell 5.1's `Invoke-RestMethod` cannot send multipart forms.
+
+#### Example: attach a server snapshot to an alert
+
+```bash
+#!/usr/bin/env bash
+# Sends an alert with a snapshot of this server attached.
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+
+{
+  echo "== uptime"; uptime
+  echo "== memory"; free -m
+  echo "== disk"; df -h
+  echo "== top processes"; ps aux --sort=-%cpu | head -n 15
+} > "$dir/diagnostics.txt" 2>&1
+# Only the end of the log, so the file stays within MAX_ATTACHMENT_SIZE_MB.
+tail -n 200 /var/log/nginx/error.log > "$dir/nginx-error.log" 2>/dev/null
+# Images work the same way, e.g. a graph saved as PNG by Grafana's render API.
+
+files=()
+for file in "$dir"/*; do
+  # An empty file would reject the whole request, alert included.
+  [ -s "$file" ] && files+=(-F "files=@$file")
+done
+
+curl -sS http://telehook.internal:3000/api/send \
+  -F "chat_ids=$TELEGRAM_CHAT_IDS" \
+  --form-string "message=🔥 High CPU on $(hostname)" \
+  "${files[@]}"
+```
+
+`TELEGRAM_CHAT_IDS` holds one or more chat IDs, such as `123456789,-1001234567890`.
+
 ### Status codes
 
-| Status | Meaning                                                                                     |
-| ------ | ------------------------------------------------------------------------------------------- |
-| 200    | Every message was delivered                                                                 |
-| 207    | At least one delivery failed (some or all). See `data.results` for the outcome of each chat |
-| 400    | Malformed JSON, failed validation, or too many recipients                                   |
-| 415    | `Content-Type` is not `application/json`                                                    |
-| 429    | Rate limit exceeded; the `Retry-After` header gives the wait in seconds                     |
-| 500    | Telegram rejected the configured bot token, or an unexpected server error occurred          |
+| Status | Meaning                                                                                                            |
+| ------ | ------------------------------------------------------------------------------------------------------------------ |
+| 200    | Every chat received the message and all files                                                                      |
+| 207    | At least one delivery failed (some or all). See `data.results` for the outcome of each chat                        |
+| 400    | Malformed JSON or form, failed validation, too many recipients or files, or an empty file                          |
+| 403    | A web browser sent the request on behalf of another site (see [Security considerations](#security-considerations)) |
+| 413    | A file is larger than `MAX_ATTACHMENT_SIZE_MB`                                                                     |
+| 415    | `Content-Type` is neither `application/json` nor `multipart/form-data`                                             |
+| 429    | Rate limit exceeded; the `Retry-After` header gives the wait in seconds                                            |
+| 500    | Telegram rejected the configured bot token, or an unexpected server error occurred                                 |
 
 The top-level `success` field is `true` only when every delivery succeeded.
 
@@ -147,20 +216,22 @@ Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/send `
 
 Common per-chat `error` values:
 
-| Error                                                                       | What it means                                                      |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `Telegram API error 400: Bad Request: chat not found`                       | Wrong ID, or the bot has never had access to that chat             |
-| `Telegram API error 403: Forbidden: bot was blocked by the user`            | The user blocked the bot                                           |
-| `Rate limited by Telegram; retry after N seconds`                           | Not delivered; safe to retry after N seconds                       |
-| `Telegram did not respond within 10000 ms; delivery could not be confirmed` | May or may not have been delivered; a retry could send a duplicate |
-| `Could not reach Telegram; delivery could not be confirmed`                 | Network failure; may or may not have been delivered                |
+| Error                                                                       | What it means                                                                            |
+| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `Telegram API error 400: Bad Request: chat not found`                       | Wrong ID, or the bot has never had access to that chat                                   |
+| `Telegram API error 403: Forbidden: bot was blocked by the user`            | The user blocked the bot                                                                 |
+| `Rate limited by Telegram; retry after N seconds`                           | Not delivered; safe to retry after N seconds                                             |
+| `Telegram did not respond within 10000 ms; delivery could not be confirmed` | May or may not have been delivered; a retry could send a duplicate                       |
+| `Could not reach Telegram; delivery could not be confirmed`                 | Network failure; may or may not have been delivered                                      |
+| `Attachment 2 ("top.txt"): <one of the errors above>`                       | The message and the files before this one were delivered; later files were not attempted |
 
 ### Delivery behaviour
 
-- Messages are sent with at most 5 Telegram requests in flight per API call. Results are returned in request order.
+- Up to 5 chats are served at a time. Each chat receives its message and files one after another. Results are returned in request order.
 - A failed chat never stops delivery to the other chats.
-- Only HTTP 429 is retried, because Telegram guarantees a rate-limited message was not sent. It is retried once, after the `retry_after` delay, and only if that delay is 5 seconds or less. Longer waits fail that chat immediately with the retry time.
-- Timeouts, network errors and Telegram 5xx responses are never retried. The message may already have been delivered, so the caller decides whether to resend.
+- Within a chat, delivery stops at the first failure. Everything before the failed item was delivered, and its error names the file if it was not the message.
+- Only HTTP 429 is retried, because Telegram guarantees a rate-limited message was not sent. It is retried once, after the `retry_after` delay, and only if that delay is 5 seconds or less. Longer waits fail that chat immediately with the retry time. Uploads follow the same rule.
+- Timeouts, network errors and Telegram 5xx responses are never retried. The message or file may already have been delivered, so the caller decides whether to resend. `TELEGRAM_REQUEST_TIMEOUT_MS` applies to each upload too; raise it if large files time out on a slow link.
 - If Telegram rejects the bot token, the remaining chats are skipped and the API responds 500.
 
 ## Telegram setup
@@ -202,9 +273,10 @@ Telegram HTTP calls are mocked in every test. A shared setup file (`test/setup.t
 
 The endpoint is intentionally unauthenticated. Anyone who can reach it can:
 
-- **Send any text, as your bot, to any chat the bot can reach.** That includes every user who started the bot, every group it belongs to, and every channel where it can post. This enables spam or phishing under your bot's name.
+- **Send any text or file, as your bot, to any chat the bot can reach.** That includes every user who started the bot, every group it belongs to, and every channel where it can post. This enables spam, phishing or malware under your bot's name.
 - **Probe chat IDs.** Per-chat errors show whether the bot can reach a given chat.
 - **Use up Telegram's rate limits**, delaying legitimate messages. Telegram may restrict or ban bots that send spam.
+- **Use up memory and bandwidth.** Uploaded files stay in memory until the request completes, at about twice their size while they are sent, and each file is uploaded to Telegram once per chat. With the defaults, one request can hold about 100 MB and upload up to 1 GB.
 
 Recommendations:
 
@@ -216,9 +288,9 @@ Recommendations:
 Built-in safeguards:
 
 - **Per-IP rate limit**, 10 requests per minute by default. Counters live in memory, so they reset on restart and are not shared between instances. Behind a reverse proxy, all clients share the proxy's IP, and therefore one limit, unless Express's `trust proxy` setting is enabled (for example `app.set('trust proxy', 1)` in `src/main.ts`). Enable it only when a proxy you control is in front: otherwise clients can spoof `X-Forwarded-For` to evade the limit.
-- **JSON-only requests.** Other content types get 415. Without this, any web page could make a visitor's browser submit a cross-site HTML form that sends messages through an instance on their network. CORS is not enabled, so browsers also block cross-origin JSON requests.
-- **Strict validation.** Recipient count is limited, unknown fields are rejected, and messages are sent as plain text.
-- **Token handling.** The token is read only from the environment and validated at startup. It never appears in responses or logs. Failed deliveries are logged with the chat ID and reason, never the message text.
+- **No cross-site browser requests.** HTML forms can post multipart bodies to any site without a CORS preflight, so without this check any web page could make a visitor's browser send messages through an instance on their network. Browsers mark such requests with the `Sec-Fetch-Site` or `Origin` header, and the API rejects them with 403. curl and server-side HTTP clients send neither header. Bodies other than JSON and multipart get 415, and CORS is not enabled, so browsers also block cross-origin JSON requests.
+- **Strict validation.** The number of recipients and files and the size of each file are limited, unknown fields are rejected, and messages are sent as plain text. Lower `MAX_ATTACHMENTS_PER_REQUEST` and `MAX_ATTACHMENT_SIZE_MB` on servers with little memory.
+- **Token handling.** The token is read only from the environment and validated at startup. It never appears in responses or logs. Failed deliveries are logged with the chat ID, the reason and the file name if a file failed, never the message text or file contents.
 
 ## Project structure
 
@@ -230,11 +302,13 @@ src/
 │   └── env.validation.ts            # environment schema, validated at startup
 ├── telegram/
 │   ├── telegram.module.ts
-│   └── telegram.service.ts          # Bot API client: timeout, error mapping, 429 retry
+│   └── telegram.service.ts          # Bot API client: messages and uploads, timeout, error mapping, 429 retry
 └── notifications/
-    ├── notifications.module.ts      # also restricts the route to JSON bodies
+    ├── notifications.module.ts      # also rejects cross-site browser requests and unsupported bodies
     ├── notifications.controller.ts  # POST /api/send
-    ├── notifications.service.ts     # recipient limit, bounded concurrency, results
+    ├── notifications.service.ts     # recipient limit, bounded concurrency, delivery order, results
+    ├── multipart-form.interceptor.ts # parses forms with files, upload limits
+    ├── attachment.ts                # photo detection, file name cleanup
     └── dto/
         └── send-notification.dto.ts # request validation
 test/

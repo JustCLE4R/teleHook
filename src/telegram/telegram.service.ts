@@ -18,7 +18,7 @@ export type TelegramFailureReason =
   | 'network_error'
   | 'invalid_response';
 
-/** A failed sendMessage call. The message is safe to return to API clients. */
+/** A failed Bot API call. The message is safe to return to API clients. */
 export class TelegramApiError extends Error {
   constructor(
     readonly reason: TelegramFailureReason,
@@ -30,8 +30,24 @@ export class TelegramApiError extends Error {
   }
 }
 
+/** A file to upload. */
+export interface TelegramFile {
+  filename: string;
+  content: Blob;
+}
+
+export interface SendFileOptions {
+  /** Text shown under the file. */
+  caption?: string;
+  /** Sends the file as a reply to this message. */
+  replyToMessageId?: number;
+  /** Delivers the file without a notification sound. */
+  silent?: boolean;
+}
+
 interface TelegramApiResponse {
   ok: boolean;
+  result?: { message_id?: unknown };
   error_code?: number;
   description?: string;
   parameters?: { retry_after?: number; migrate_to_chat_id?: number };
@@ -40,22 +56,53 @@ interface TelegramApiResponse {
 @Injectable()
 export class TelegramService {
   private readonly logger = new Logger(TelegramService.name);
-  private readonly sendMessageUrl: string;
+  private readonly botUrl: string;
   private readonly timeoutMs: number;
 
   constructor(config: ConfigService<EnvironmentVariables, true>) {
     const token = config.get('TELEGRAM_BOT_TOKEN', { infer: true });
-    this.sendMessageUrl = `${TELEGRAM_API_URL}/bot${token}/sendMessage`;
+    this.botUrl = `${TELEGRAM_API_URL}/bot${token}`;
     this.timeoutMs = config.get('TELEGRAM_REQUEST_TIMEOUT_MS', { infer: true });
   }
 
   /**
-   * Sends a plain-text message. Resolves once Telegram confirms delivery and
-   * throws a TelegramApiError otherwise.
+   * Sends a plain-text message. Resolves with the new message's ID once
+   * Telegram confirms delivery and throws a TelegramApiError otherwise.
    */
-  async sendMessage(chatId: string, text: string): Promise<void> {
+  sendMessage(chatId: string, text: string): Promise<number | undefined> {
+    return this.call('sendMessage', JSON.stringify({ chat_id: chatId, text }));
+  }
+
+  /**
+   * Uploads an image that Telegram shows inline, after compressing it. Same
+   * outcome contract as sendMessage.
+   */
+  sendPhoto(
+    chatId: string,
+    file: TelegramFile,
+    options: SendFileOptions = {},
+  ): Promise<number | undefined> {
+    return this.call('sendPhoto', fileForm(chatId, 'photo', file, options));
+  }
+
+  /** Uploads a file unchanged. Same outcome contract as sendMessage. */
+  sendDocument(
+    chatId: string,
+    file: TelegramFile,
+    options: SendFileOptions = {},
+  ): Promise<number | undefined> {
+    return this.call(
+      'sendDocument',
+      fileForm(chatId, 'document', file, options),
+    );
+  }
+
+  private async call(
+    method: string,
+    body: string | FormData,
+  ): Promise<number | undefined> {
     try {
-      await this.postSendMessage(chatId, text);
+      return await this.post(method, body);
     } catch (error) {
       const retryAfter = retryableDelaySeconds(error);
       if (retryAfter === undefined) {
@@ -65,18 +112,25 @@ export class TelegramService {
       // retry cannot create a duplicate. Nothing else is retried: after a
       // timeout or network error the message may already have been delivered.
       await sleep(retryAfter * 1000);
-      await this.postSendMessage(chatId, text);
+      return this.post(method, body);
     }
   }
 
-  private async postSendMessage(chatId: string, text: string): Promise<void> {
+  private async post(
+    method: string,
+    body: string | FormData,
+  ): Promise<number | undefined> {
     let response: Response;
     let rawBody: string;
     try {
-      response = await fetch(this.sendMessageUrl, {
+      response = await fetch(`${this.botUrl}/${method}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text }),
+        // For FormData, fetch sets the multipart Content-Type and boundary.
+        headers:
+          typeof body === 'string'
+            ? { 'Content-Type': 'application/json' }
+            : undefined,
+        body,
         signal: AbortSignal.timeout(this.timeoutMs),
       });
       rawBody = await response.text();
@@ -84,11 +138,12 @@ export class TelegramService {
       throw this.toTransportError(error);
     }
 
-    const body = parseTelegramResponse(rawBody);
-    if (response.ok && body?.ok) {
-      return;
+    const parsed = parseTelegramResponse(rawBody);
+    if (response.ok && parsed?.ok) {
+      const messageId = parsed.result?.message_id;
+      return typeof messageId === 'number' ? messageId : undefined;
     }
-    throw toApiError(response.status, body);
+    throw toApiError(response.status, parsed);
   }
 
   private toTransportError(error: unknown): TelegramApiError {
@@ -109,6 +164,34 @@ export class TelegramService {
       'Could not reach Telegram; delivery could not be confirmed',
     );
   }
+}
+
+function fileForm(
+  chatId: string,
+  field: 'photo' | 'document',
+  file: TelegramFile,
+  options: SendFileOptions,
+): FormData {
+  const form = new FormData();
+  form.append('chat_id', chatId);
+  form.append(field, file.content, file.filename);
+  if (options.caption !== undefined) {
+    form.append('caption', options.caption);
+  }
+  if (options.replyToMessageId !== undefined) {
+    // If the message is gone by now, the file is still sent, just not as a reply.
+    form.append(
+      'reply_parameters',
+      JSON.stringify({
+        message_id: options.replyToMessageId,
+        allow_sending_without_reply: true,
+      }),
+    );
+  }
+  if (options.silent) {
+    form.append('disable_notification', 'true');
+  }
+  return form;
 }
 
 function toApiError(

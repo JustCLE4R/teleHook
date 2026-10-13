@@ -24,6 +24,17 @@ export class EnvironmentVariables {
   @IsInt()
   MAX_RECIPIENTS_PER_REQUEST: number = 20;
 
+  @Max(10)
+  @Min(1)
+  @IsInt()
+  MAX_ATTACHMENTS_PER_REQUEST: number = 5;
+
+  // Telegram accepts uploads of at most 50 MB from bots.
+  @Max(50)
+  @Min(1)
+  @IsInt()
+  MAX_ATTACHMENT_SIZE_MB: number = 10;
+
   @Max(60_000)
   @Min(1_000)
   @IsInt()

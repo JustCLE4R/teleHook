@@ -8,7 +8,11 @@ import { AppModule } from '../src/app.module.js';
 // Matches the environment in vitest.config.e2e.ts.
 const TOKEN = '123456789:e2e-test-token';
 const MAX_RECIPIENTS = 20;
+const MAX_ATTACHMENTS = 3;
+const MAX_ATTACHMENT_BYTES = 1024 * 1024;
 const RATE_LIMIT = 5;
+
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0]);
 
 const CHAT_ID_FORMAT_ERROR =
   'each chat ID must be a numeric Telegram chat ID such as "123456789" or "-1001234567890"';
@@ -31,7 +35,30 @@ function chatIds(count: number): string[] {
 }
 
 function chatIdOf(init: RequestInit | undefined): string {
+  if (init?.body instanceof FormData) {
+    return init.body.get('chat_id') as string;
+  }
   return (JSON.parse(init?.body as string) as { chat_id: string }).chat_id;
+}
+
+/** The Bot API method and parameters of a Telegram call; files as name and text. */
+async function telegramCall([url, init]: Parameters<typeof fetch>): Promise<{
+  method: string | undefined;
+  params: Record<string, unknown>;
+}> {
+  // TelegramService always passes the URL as a string.
+  const method = typeof url === 'string' ? url.split('/').pop() : undefined;
+  if (!(init?.body instanceof FormData)) {
+    return { method, params: JSON.parse(init?.body as string) };
+  }
+  const params: Record<string, unknown> = {};
+  for (const [name, value] of init.body) {
+    params[name] =
+      typeof value === 'string'
+        ? value
+        : { filename: value.name, text: await value.text() };
+  }
+  return { method, params };
 }
 
 describe('POST /api/send (e2e)', () => {
@@ -40,6 +67,12 @@ describe('POST /api/send (e2e)', () => {
 
   const post = (body: object) =>
     request(app.getHttpServer()).post('/api/send').send(body);
+
+  /** A multipart request; add fields with .field() and files with .attach(). */
+  const postForm = () => request(app.getHttpServer()).post('/api/send');
+
+  const telegramCalls = () =>
+    Promise.all(fetchMock.mock.calls.map((call) => telegramCall(call)));
 
   beforeEach(async () => {
     fetchMock = vi.fn<typeof fetch>(async () => delivered());
@@ -372,8 +405,373 @@ describe('POST /api/send (e2e)', () => {
         .send(body)
         .expect(415);
 
-      expect(res.body.message).toBe('Content-Type must be application/json');
+      expect(res.body.message).toBe(
+        'Content-Type must be application/json or multipart/form-data',
+      );
       expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('attachments (multipart/form-data)', () => {
+    it('sends the message, then each file as a silent reply to it', async () => {
+      const res = await postForm()
+        .field('chat_ids', '123456789')
+        .field('message', 'Disk almost full on web-1')
+        .attach('files', PNG, 'disk.png')
+        .attach('files', Buffer.from('/dev/sda1  98%  /'), 'df.txt')
+        .expect(200);
+
+      expect(res.body).toEqual({
+        success: true,
+        message: 'Notification processing completed',
+        data: {
+          total: 1,
+          sent: 1,
+          failed: 0,
+          results: [{ chat_id: '123456789', success: true }],
+        },
+      });
+      const reply = {
+        reply_parameters: JSON.stringify({
+          message_id: 1,
+          allow_sending_without_reply: true,
+        }),
+        disable_notification: 'true',
+      };
+      await expect(telegramCalls()).resolves.toEqual([
+        {
+          method: 'sendMessage',
+          params: { chat_id: '123456789', text: 'Disk almost full on web-1' },
+        },
+        {
+          method: 'sendPhoto',
+          params: {
+            chat_id: '123456789',
+            photo: { filename: 'disk.png', text: PNG.toString() },
+            caption: 'disk.png',
+            ...reply,
+          },
+        },
+        {
+          method: 'sendDocument',
+          params: {
+            chat_id: '123456789',
+            document: { filename: 'df.txt', text: '/dev/sda1  98%  /' },
+            ...reply,
+          },
+        },
+      ]);
+    });
+
+    it('accepts a text-only form', async () => {
+      await postForm()
+        .field('chat_ids', '123')
+        .field('message', 'Hello')
+        .expect(200);
+
+      await expect(telegramCalls()).resolves.toEqual([
+        { method: 'sendMessage', params: { chat_id: '123', text: 'Hello' } },
+      ]);
+    });
+
+    it.each([
+      [
+        'repeated fields',
+        [
+          ['chat_ids', '111'],
+          ['chat_ids', '222'],
+        ],
+      ],
+      ['a comma-separated list', [['chat_ids', '111, 222']]],
+      [
+        'bracketed fields, as axios sends them',
+        [
+          ['chat_ids[]', '111'],
+          ['chat_ids[]', '222'],
+        ],
+      ],
+    ])('accepts chat IDs as %s', async (_case, fields) => {
+      const req = postForm().field('message', 'Hello');
+      for (const [name, value] of fields) {
+        req.field(name, value);
+      }
+
+      const res = await req.expect(200);
+
+      expect(res.body.data.results).toEqual([
+        { chat_id: '111', success: true },
+        { chat_id: '222', success: true },
+      ]);
+    });
+
+    it('keeps UTF-8 file names', async () => {
+      await postForm()
+        .field('chat_ids', '123')
+        .field('message', 'Hello')
+        .attach('files', Buffer.from('x'), 'диагностика 1.txt')
+        .expect(200);
+
+      const calls = await telegramCalls();
+      expect(calls[1].params.document).toEqual({
+        filename: 'диагностика 1.txt',
+        text: 'x',
+      });
+    });
+
+    it('names the attachment that failed', async () => {
+      fetchMock.mockImplementation(async (_url, init) => {
+        const document =
+          init?.body instanceof FormData ? init.body.get('document') : null;
+        return chatIdOf(init) === '222' &&
+          document instanceof File &&
+          document.name === 'df.txt'
+          ? failure(400, 'Bad Request: file must be non-empty')
+          : delivered();
+      });
+
+      const res = await postForm()
+        .field('chat_ids', '111,222')
+        .field('message', 'Disk almost full')
+        .attach('files', Buffer.from('a'), 'dmesg.txt')
+        .attach('files', Buffer.from('b'), 'df.txt')
+        .expect(207);
+
+      expect(res.body.data).toEqual({
+        total: 2,
+        sent: 1,
+        failed: 1,
+        results: [
+          { chat_id: '111', success: true },
+          {
+            chat_id: '222',
+            success: false,
+            error:
+              'Attachment 2 ("df.txt"): Telegram API error 400: Bad Request: file must be non-empty',
+          },
+        ],
+      });
+    });
+
+    describe('validation', () => {
+      it.each([
+        [
+          'a missing message',
+          [['chat_ids', '123']],
+          'message must be a string',
+        ],
+        [
+          'a repeated message',
+          [
+            ['chat_ids', '123'],
+            ['message', 'a'],
+            ['message', 'b'],
+          ],
+          'message must be a string',
+        ],
+        [
+          'a malformed chat ID',
+          [
+            ['chat_ids', '123,abc'],
+            ['message', 'Hello'],
+          ],
+          CHAT_ID_FORMAT_ERROR,
+        ],
+        [
+          'an empty entry in a chat ID list',
+          [
+            ['chat_ids', '123,'],
+            ['message', 'Hello'],
+          ],
+          CHAT_ID_FORMAT_ERROR,
+        ],
+        [
+          'a missing chat_ids field',
+          [['message', 'Hello']],
+          'chat_ids must be an array of chat ID strings',
+        ],
+        [
+          'a gap in indexed chat_ids fields',
+          [
+            ['chat_ids[1]', '123'],
+            ['message', 'Hello'],
+          ],
+          'each chat ID must be a string',
+        ],
+        [
+          'duplicate chat IDs across fields',
+          [
+            ['chat_ids', '123'],
+            ['chat_ids', '123'],
+            ['message', 'Hello'],
+          ],
+          'chat_ids must not contain duplicates',
+        ],
+        [
+          'an unexpected field',
+          [
+            ['chat_ids', '123'],
+            ['message', 'Hello'],
+            ['parse_mode', 'HTML'],
+          ],
+          'property parse_mode should not exist',
+        ],
+        [
+          'files sent as text instead of uploads',
+          [
+            ['chat_ids', '123'],
+            ['message', 'Hello'],
+            ['files', '/tmp/top.txt'],
+          ],
+          'files must be file uploads, not text fields',
+        ],
+        [
+          'an array index far beyond the field limit',
+          [
+            ['chat_ids[1000000000]', '123'],
+            ['message', 'Hello'],
+          ],
+          'Field name array index too large: chat_ids[1000000000]',
+        ],
+      ])('rejects %s', async (_case, fields, expectedError) => {
+        const req = postForm();
+        for (const [name, value] of fields) {
+          req.field(name, value);
+        }
+
+        const res = await req.expect(400);
+
+        expect(res.body.message).toEqual([expectedError]);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it(`rejects more than ${MAX_RECIPIENTS} recipients in a list`, async () => {
+        const res = await postForm()
+          .field('chat_ids', chatIds(MAX_RECIPIENTS + 1).join(','))
+          .field('message', 'Hello')
+          .expect(400);
+
+        expect(res.body.message).toEqual([
+          `chat_ids must contain at most ${MAX_RECIPIENTS} chat IDs`,
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it(`accepts files of up to ${MAX_ATTACHMENT_BYTES} bytes`, async () => {
+        await postForm()
+          .field('chat_ids', '123')
+          .field('message', 'Hello')
+          .attach('files', Buffer.alloc(MAX_ATTACHMENT_BYTES, 'a'), 'big.log')
+          .expect(200);
+      });
+
+      it('rejects a larger file with 413', async () => {
+        const res = await postForm()
+          .field('chat_ids', '123')
+          .field('message', 'Hello')
+          .attach('files', Buffer.from('x'), 'small.log')
+          .attach('files', Buffer.alloc(MAX_ATTACHMENT_BYTES + 1), 'big.log')
+          .expect(413);
+
+        expect(res.body.message).toBe(
+          'each file must be at most 1 MB ("big.log" is larger)',
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it(`rejects more than ${MAX_ATTACHMENTS} files`, async () => {
+        const req = postForm()
+          .field('chat_ids', '123')
+          .field('message', 'Hello');
+        for (let i = 0; i <= MAX_ATTACHMENTS; i++) {
+          req.attach('files', Buffer.from('x'), `${i}.txt`);
+        }
+
+        const res = await req.expect(400);
+
+        expect(res.body.message).toEqual([
+          `files must contain at most ${MAX_ATTACHMENTS} files`,
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('rejects a file in a field other than files', async () => {
+        const res = await postForm()
+          .field('chat_ids', '123')
+          .attach('message', Buffer.from('Hello'), 'message.txt')
+          .expect(400);
+
+        expect(res.body.message).toEqual([
+          'unexpected file in field "message"; only "files" may contain files',
+        ]);
+      });
+
+      it('rejects an empty file, which Telegram would refuse', async () => {
+        const res = await postForm()
+          .field('chat_ids', '123')
+          .field('message', 'Hello')
+          .attach('files', Buffer.alloc(0), 'errors.log')
+          .expect(400);
+
+        expect(res.body.message).toEqual([
+          'each file must not be empty ("errors.log" is empty)',
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('rejects a truncated multipart body', async () => {
+        const res = await postForm()
+          .set('Content-Type', 'multipart/form-data; boundary=xyz')
+          .send(
+            '--xyz\r\nContent-Disposition: form-data; name="message"\r\n\r\nHel',
+          )
+          .expect(400);
+
+        expect(res.body.message).toEqual([
+          'malformed multipart body: Unexpected end of form',
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('cross-site requests', () => {
+    const FORBIDDEN = 'Cross-site requests from web browsers are not allowed';
+    const body = { chat_ids: ['123'], message: 'Hello' };
+
+    it.each([
+      ['Origin', 'https://evil.example'],
+      ['Origin', 'null'],
+      ['Sec-Fetch-Site', 'cross-site'],
+      ['Sec-Fetch-Site', 'same-site'],
+    ])('rejects a JSON request with %s: %s', async (header, value) => {
+      const res = await post(body).set(header, value).expect(403);
+
+      expect(res.body.message).toBe(FORBIDDEN);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a form posted from another site', async () => {
+      const res = await postForm()
+        .set('Origin', 'https://evil.example')
+        .field('chat_ids', '123')
+        .field('message', 'Hello')
+        .expect(403);
+
+      expect(res.body.message).toBe(FORBIDDEN);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['Sec-Fetch-Site: same-origin', { 'Sec-Fetch-Site': 'same-origin' }],
+      [
+        'an Origin that matches the Host',
+        {
+          Host: 'Telehook.internal:3000',
+          Origin: 'http://telehook.internal:3000',
+        },
+      ],
+    ])('accepts a browser request with %s', async (_case, headers) => {
+      await post(body).set(headers).expect(200);
     });
   });
 

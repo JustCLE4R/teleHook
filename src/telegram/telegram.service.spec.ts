@@ -5,7 +5,8 @@ import type { EnvironmentVariables } from '../config/env.validation.js';
 import { TelegramService } from './telegram.service.js';
 
 const TOKEN = '123456789:unit-test-token';
-const SEND_MESSAGE_URL = `https://api.telegram.org/bot${TOKEN}/sendMessage`;
+const BOT_URL = `https://api.telegram.org/bot${TOKEN}`;
+const SEND_MESSAGE_URL = `${BOT_URL}/sendMessage`;
 
 function createService(timeoutMs = 1_000): TelegramService {
   const values: Partial<EnvironmentVariables> = {
@@ -41,6 +42,29 @@ const rateLimited = (retryAfter: number) =>
     retry_after: retryAfter,
   });
 
+const report = () => ({
+  filename: 'top.txt',
+  content: new Blob(['load average: 9.87'], { type: 'text/plain' }),
+});
+
+/** The form fields of an upload, with files replaced by their name and text. */
+async function formFields(
+  init: RequestInit | undefined,
+): Promise<Record<string, unknown>> {
+  const body = init?.body;
+  if (!(body instanceof FormData)) {
+    throw new Error('Expected a multipart/form-data body');
+  }
+  const fields: Record<string, unknown> = {};
+  for (const [name, value] of body) {
+    fields[name] =
+      typeof value === 'string'
+        ? value
+        : { filename: value.name, text: await value.text() };
+  }
+  return fields;
+}
+
 describe('TelegramService', () => {
   let fetchMock: Mock<typeof fetch>;
 
@@ -64,6 +88,81 @@ describe('TelegramService', () => {
       text: 'Server is down!',
     });
     expect(init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('resolves with the ID of the sent message', async () => {
+    fetchMock.mockResolvedValue(
+      telegramResponse(200, { ok: true, result: { message_id: 42 } }),
+    );
+
+    await expect(createService().sendMessage('123', 'hi')).resolves.toBe(42);
+  });
+
+  it('resolves without an ID when Telegram does not return one', async () => {
+    fetchMock.mockResolvedValue(telegramResponse(200, { ok: true }));
+
+    await expect(
+      createService().sendMessage('123', 'hi'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('uploads a photo as multipart form data with the given options', async () => {
+    fetchMock.mockResolvedValue(delivered());
+
+    await expect(
+      createService().sendPhoto(
+        '-1001234567890',
+        {
+          filename: 'cpu.png',
+          content: new Blob(['png bytes'], { type: 'image/png' }),
+        },
+        { caption: 'cpu.png', replyToMessageId: 7, silent: true },
+      ),
+    ).resolves.toBe(1);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(`${BOT_URL}/sendPhoto`);
+    expect(init?.method).toBe('POST');
+    // fetch derives the multipart Content-Type, including the boundary.
+    expect(init?.headers).toBeUndefined();
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    await expect(formFields(init)).resolves.toEqual({
+      chat_id: '-1001234567890',
+      photo: { filename: 'cpu.png', text: 'png bytes' },
+      caption: 'cpu.png',
+      reply_parameters: JSON.stringify({
+        message_id: 7,
+        allow_sending_without_reply: true,
+      }),
+      disable_notification: 'true',
+    });
+  });
+
+  it('uploads a document with no optional fields by default', async () => {
+    fetchMock.mockResolvedValue(delivered());
+
+    await createService().sendDocument('123', report());
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(`${BOT_URL}/sendDocument`);
+    await expect(formFields(init)).resolves.toEqual({
+      chat_id: '123',
+      document: { filename: 'top.txt', text: 'load average: 9.87' },
+    });
+  });
+
+  it('reports upload errors like message errors', async () => {
+    fetchMock.mockResolvedValue(
+      failure(400, 'Bad Request: PHOTO_INVALID_DIMENSIONS'),
+    );
+
+    await expect(
+      createService().sendPhoto('123', report()),
+    ).rejects.toMatchObject({
+      reason: 'rejected',
+      message: 'Telegram API error 400: Bad Request: PHOTO_INVALID_DIMENSIONS',
+    });
   });
 
   it('reports Telegram API errors with their description', async () => {
@@ -121,8 +220,26 @@ describe('TelegramService', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(1);
 
-      await expect(sending).resolves.toBeUndefined();
+      await expect(sending).resolves.toBe(1);
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('uploads the file again on the retry', async () => {
+      fetchMock
+        .mockResolvedValueOnce(rateLimited(1))
+        .mockResolvedValueOnce(delivered());
+
+      const sending = createService().sendDocument('123', report());
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(sending).resolves.toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      for (const [url, init] of fetchMock.mock.calls) {
+        expect(url).toBe(`${BOT_URL}/sendDocument`);
+        await expect(formFields(init)).resolves.toMatchObject({
+          document: { filename: 'top.txt', text: 'load average: 9.87' },
+        });
+      }
     });
 
     it('gives up when the retry is rate limited too', async () => {

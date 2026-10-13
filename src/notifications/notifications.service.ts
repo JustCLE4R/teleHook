@@ -10,6 +10,7 @@ import {
   TelegramApiError,
   TelegramService,
 } from '../telegram/telegram.service.js';
+import type { Attachment } from './attachment.js';
 
 /** Upper bound on simultaneous Telegram requests for a single API call. */
 const MAX_CONCURRENT_DELIVERIES = 5;
@@ -42,10 +43,15 @@ export class NotificationsService {
   }
 
   /**
-   * Sends `message` to every chat and reports the outcome per chat, in request
-   * order. A failed chat never stops delivery to the others.
+   * Sends `message`, followed by any attachments, to every chat and reports
+   * the outcome per chat, in request order. A failed chat never stops
+   * delivery to the others.
    */
-  async send(chatIds: string[], message: string): Promise<DeliverySummary> {
+  async send(
+    chatIds: string[],
+    message: string,
+    attachments: readonly Attachment[] = [],
+  ): Promise<DeliverySummary> {
     if (chatIds.length > this.maxRecipients) {
       // Same body shape as the ValidationPipe's errors.
       throw new BadRequestException([
@@ -56,7 +62,7 @@ export class NotificationsService {
     const results = await mapWithConcurrency(
       chatIds,
       MAX_CONCURRENT_DELIVERIES,
-      (chatId) => this.deliver(chatId, message),
+      (chatId) => this.deliver(chatId, message, attachments),
     );
     const sent = results.filter((result) => result.success).length;
     return {
@@ -67,37 +73,102 @@ export class NotificationsService {
     };
   }
 
+  /**
+   * Sends the message, then each attachment in order, and stops at the first
+   * failure: everything before the failed item was delivered.
+   */
   private async deliver(
     chatId: string,
     message: string,
+    attachments: readonly Attachment[],
   ): Promise<DeliveryResult> {
+    let messageId: number | undefined;
     try {
-      await this.telegram.sendMessage(chatId, message);
-      return { chat_id: chatId, success: true };
+      messageId = await this.telegram.sendMessage(chatId, message);
     } catch (error) {
-      if (error instanceof TelegramApiError) {
-        if (error.reason === 'unauthorized') {
-          // Not a per-chat failure: every delivery would fail the same way.
-          this.logger.error(
-            'Telegram rejected the bot token; check TELEGRAM_BOT_TOKEN',
-          );
-          throw new InternalServerErrorException(
-            'Telegram delivery is unavailable because of a server configuration error',
-          );
-        }
-        this.logger.warn(`Delivery to chat ${chatId} failed: ${error.message}`);
-        return { chat_id: chatId, success: false, error: error.message };
-      }
-      this.logger.error(
-        `Unexpected error while delivering to chat ${chatId}`,
-        error instanceof Error ? error.stack : String(error),
-      );
-      return {
-        chat_id: chatId,
-        success: false,
-        error: 'Unexpected error while sending the message',
-      };
+      return this.failure(chatId, error);
     }
+
+    for (const [index, attachment] of attachments.entries()) {
+      try {
+        await this.sendAttachment(chatId, attachment, messageId);
+      } catch (error) {
+        return this.failure(
+          chatId,
+          error,
+          `Attachment ${index + 1} ("${attachment.filename}")`,
+        );
+      }
+    }
+    return { chat_id: chatId, success: true };
+  }
+
+  /**
+   * Sends the attachment as a silent reply to the message, so it stays next
+   * to its alert in a busy chat and each alert notifies only once.
+   */
+  private async sendAttachment(
+    chatId: string,
+    attachment: Attachment,
+    replyToMessageId: number | undefined,
+  ): Promise<void> {
+    const options = { replyToMessageId, silent: true };
+    if (attachment.isPhoto) {
+      try {
+        await this.telegram.sendPhoto(chatId, attachment, {
+          ...options,
+          // Photos, unlike files, show no name.
+          caption: attachment.filename,
+        });
+        return;
+      } catch (error) {
+        // A refusal means nothing was sent, so the image can safely go out as
+        // a file instead, for example when its aspect ratio is too extreme.
+        if (error instanceof TelegramApiError && error.reason === 'rejected') {
+          this.logger.warn(
+            `Telegram refused "${attachment.filename}" as a photo for chat ${chatId}; sending it as a file: ${error.message}`,
+          );
+        } else {
+          throw error;
+        }
+      }
+    }
+    await this.telegram.sendDocument(chatId, attachment, options);
+  }
+
+  /** `item` names the attachment that failed, if it was not the message. */
+  private failure(
+    chatId: string,
+    error: unknown,
+    item?: string,
+  ): DeliveryResult {
+    if (error instanceof TelegramApiError) {
+      if (error.reason === 'unauthorized') {
+        // Not a per-chat failure: every delivery would fail the same way.
+        this.logger.error(
+          'Telegram rejected the bot token; check TELEGRAM_BOT_TOKEN',
+        );
+        throw new InternalServerErrorException(
+          'Telegram delivery is unavailable because of a server configuration error',
+        );
+      }
+      const reason =
+        item === undefined ? error.message : `${item}: ${error.message}`;
+      this.logger.warn(`Delivery to chat ${chatId} failed: ${reason}`);
+      return { chat_id: chatId, success: false, error: reason };
+    }
+    this.logger.error(
+      `Unexpected error while delivering to chat ${chatId}`,
+      error instanceof Error ? error.stack : String(error),
+    );
+    return {
+      chat_id: chatId,
+      success: false,
+      error:
+        item === undefined
+          ? 'Unexpected error while sending the message'
+          : `${item}: Unexpected error while sending the file`,
+    };
   }
 }
 

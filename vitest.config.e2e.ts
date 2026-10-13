@@ -14,6 +14,8 @@ export default defineConfig({
     env: {
       TELEGRAM_BOT_TOKEN: '123456789:e2e-test-token',
       MAX_RECIPIENTS_PER_REQUEST: '20',
+      MAX_ATTACHMENTS_PER_REQUEST: '3',
+      MAX_ATTACHMENT_SIZE_MB: '1',
       TELEGRAM_REQUEST_TIMEOUT_MS: '1000',
       RATE_LIMIT_TTL_MS: '60000',
       RATE_LIMIT_MAX_REQUESTS: '5',
