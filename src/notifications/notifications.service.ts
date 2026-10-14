@@ -7,6 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import type { EnvironmentVariables } from '../config/env.validation.js';
 import {
+  type SendFileOptions,
   TelegramApiError,
   TelegramService,
 } from '../telegram/telegram.service.js';
@@ -14,6 +15,9 @@ import type { Attachment } from './attachment.js';
 
 /** Upper bound on simultaneous Telegram requests for a single API call. */
 const MAX_CONCURRENT_DELIVERIES = 5;
+
+/** Telegram's limit for a caption, in UTF-16 code units like the message. */
+const TELEGRAM_MAX_CAPTION_LENGTH = 1024;
 
 export interface DeliveryResult {
   chat_id: string;
@@ -74,14 +78,23 @@ export class NotificationsService {
   }
 
   /**
-   * Sends the message, then each attachment in order, and stops at the first
-   * failure: everything before the failed item was delivered.
+   * Sends a single attachment with the message as its caption when the
+   * message fits. Otherwise sends the message, then each attachment in order,
+   * and stops at the first failure: everything before the failed item was
+   * delivered.
    */
   private async deliver(
     chatId: string,
     message: string,
     attachments: readonly Attachment[],
   ): Promise<DeliveryResult> {
+    if (
+      attachments.length === 1 &&
+      message.length <= TELEGRAM_MAX_CAPTION_LENGTH
+    ) {
+      return this.deliverCaptioned(chatId, message, attachments[0]);
+    }
+
     let messageId: number | undefined;
     try {
       messageId = await this.telegram.sendMessage(chatId, message);
@@ -89,42 +102,55 @@ export class NotificationsService {
       return this.failure(chatId, error);
     }
 
+    // Silent replies keep the files next to their alert in a busy chat, and
+    // each alert notifies only once.
+    const options = { replyToMessageId: messageId, silent: true };
     for (const [index, attachment] of attachments.entries()) {
       try {
-        await this.sendAttachment(chatId, attachment, messageId);
+        await this.sendAttachment(chatId, attachment, options);
       } catch (error) {
-        return this.failure(
-          chatId,
-          error,
-          `Attachment ${index + 1} ("${attachment.filename}")`,
-        );
+        return this.failure(chatId, error, attachmentLabel(index, attachment));
       }
     }
     return { chat_id: chatId, success: true };
   }
 
-  /**
-   * Sends the attachment as a silent reply to the message, so it stays next
-   * to its alert in a busy chat and each alert notifies only once.
-   */
+  /** Sends one attachment captioned with the message, as a single post. */
+  private async deliverCaptioned(
+    chatId: string,
+    message: string,
+    attachment: Attachment,
+  ): Promise<DeliveryResult> {
+    try {
+      await this.sendAttachment(chatId, attachment, { caption: message });
+      return { chat_id: chatId, success: true };
+    } catch (error) {
+      if (!isRefusal(error)) {
+        return this.failure(chatId, error, attachmentLabel(0, attachment));
+      }
+      // Nothing was sent, so the alert itself can still go out as text.
+      try {
+        await this.telegram.sendMessage(chatId, message);
+      } catch (messageError) {
+        return this.failure(chatId, messageError);
+      }
+      return this.failure(chatId, error, attachmentLabel(0, attachment));
+    }
+  }
+
   private async sendAttachment(
     chatId: string,
     attachment: Attachment,
-    replyToMessageId: number | undefined,
+    options: SendFileOptions,
   ): Promise<void> {
-    const options = { replyToMessageId, silent: true };
     if (attachment.isPhoto) {
       try {
-        await this.telegram.sendPhoto(chatId, attachment, {
-          ...options,
-          // Photos, unlike files, show no name.
-          caption: attachment.filename,
-        });
+        await this.telegram.sendPhoto(chatId, attachment, options);
         return;
       } catch (error) {
         // A refusal means nothing was sent, so the image can safely go out as
         // a file instead, for example when its aspect ratio is too extreme.
-        if (error instanceof TelegramApiError && error.reason === 'rejected') {
+        if (isRefusal(error)) {
           this.logger.warn(
             `Telegram refused "${attachment.filename}" as a photo for chat ${chatId}; sending it as a file: ${error.message}`,
           );
@@ -170,6 +196,15 @@ export class NotificationsService {
           : `${item}: Unexpected error while sending the file`,
     };
   }
+}
+
+/** Telegram refused the request, so nothing was sent and a retry is safe. */
+function isRefusal(error: unknown): error is TelegramApiError {
+  return error instanceof TelegramApiError && error.reason === 'rejected';
+}
+
+function attachmentLabel(index: number, attachment: Attachment): string {
+  return `Attachment ${index + 1} ("${attachment.filename}")`;
 }
 
 /**

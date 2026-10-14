@@ -83,12 +83,17 @@ curl http://localhost:3000/api/send \
 | `message`  | As in JSON. Required, also when files are attached.                                                                                                                   |
 | `files`    | Optional. Up to `MAX_ATTACHMENTS_PER_REQUEST` files (default 5), one `files` field each. Each must be non-empty and at most `MAX_ATTACHMENT_SIZE_MB` (default 10 MB). |
 
-Each chat receives:
+**One file:** each chat receives a single post, the file with the message as its caption. Telegram limits captions to 1024 characters, so a longer message is sent as with several files. If Telegram refuses the file, the message is still sent as text, and the result reports the file's error.
+
+**Several files:** each chat receives:
 
 1. **The message**, exactly as for a JSON request. It goes first, so the alert arrives even if an upload fails.
-2. **Each file, in upload order**, as a reply to the message and without a notification sound. The files stay attached to their alert in a busy chat, and each alert notifies once.
-   - JPEG and PNG images of up to 10 MB are sent as **photos**: shown inline, compressed by Telegram, with the file name as caption. If Telegram refuses an image as a photo, for example a very tall screenshot, it is sent as a file instead.
-   - Everything else, including other image formats, is sent as a **file**, unchanged, under its original name.
+2. **Each file, in upload order**, without a caption, as a reply to the message and without a notification sound. The files stay attached to their alert in a busy chat, and each alert notifies once.
+
+Either way:
+
+- JPEG and PNG images of up to 10 MB are sent as **photos**: shown inline and compressed by Telegram. If Telegram refuses an image as a photo, for example a very tall screenshot, it is sent as a file instead.
+- Everything else, including other image formats, is sent as a **file**, unchanged, under its original name.
 
 The request is validated as a whole before anything is sent. An empty file, a file over the size limit, or too many files rejects the request, **message included**. Scripts should attach only non-empty files within the limit, as in the example below.
 
@@ -229,7 +234,7 @@ Common per-chat `error` values:
 
 - Up to 5 chats are served at a time. Each chat receives its message and files one after another. Results are returned in request order.
 - A failed chat never stops delivery to the other chats.
-- Within a chat, delivery stops at the first failure. Everything before the failed item was delivered, and its error names the file if it was not the message.
+- Within a chat, delivery stops at the first failure. Everything before the failed item was delivered, and its error names the file if it was not the message. With a single captioned file, `Attachment 1 (...)` means the message went out as text after Telegram refused the file, unless the upload timed out or failed in transit, in which case nothing more is sent.
 - Only HTTP 429 is retried, because Telegram guarantees a rate-limited message was not sent. It is retried once, after the `retry_after` delay, and only if that delay is 5 seconds or less. Longer waits fail that chat immediately with the retry time. Uploads follow the same rule.
 - Timeouts, network errors and Telegram 5xx responses are never retried. The message or file may already have been delivered, so the caller decides whether to resend. `TELEGRAM_REQUEST_TIMEOUT_MS` applies to each upload too; raise it if large files time out on a slow link.
 - If Telegram rejects the bot token, the remaining chats are skipped and the API responds 500.

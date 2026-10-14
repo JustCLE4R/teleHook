@@ -448,7 +448,6 @@ describe('POST /api/send (e2e)', () => {
           params: {
             chat_id: '123456789',
             photo: { filename: 'disk.png', text: PNG.toString() },
-            caption: 'disk.png',
             ...reply,
           },
         },
@@ -504,6 +503,25 @@ describe('POST /api/send (e2e)', () => {
       ]);
     });
 
+    it('sends a single file with the message as its caption', async () => {
+      await postForm()
+        .field('chat_ids', '123')
+        .field('message', 'Disk almost full on web-1')
+        .attach('files', PNG, 'disk.png')
+        .expect(200);
+
+      await expect(telegramCalls()).resolves.toEqual([
+        {
+          method: 'sendPhoto',
+          params: {
+            chat_id: '123',
+            photo: { filename: 'disk.png', text: PNG.toString() },
+            caption: 'Disk almost full on web-1',
+          },
+        },
+      ]);
+    });
+
     it('keeps UTF-8 file names', async () => {
       await postForm()
         .field('chat_ids', '123')
@@ -512,7 +530,7 @@ describe('POST /api/send (e2e)', () => {
         .expect(200);
 
       const calls = await telegramCalls();
-      expect(calls[1].params.document).toEqual({
+      expect(calls[0].params.document).toEqual({
         filename: 'диагностика 1.txt',
         text: 'x',
       });

@@ -196,38 +196,25 @@ describe('NotificationsService', () => {
     expect(sendMessage).toHaveBeenCalledTimes(5);
   });
 
-  describe('with attachments', () => {
-    const silentReply = { replyToMessageId: MESSAGE_ID, silent: true };
-
-    it('sends each attachment after the message, as a silent reply to it', async () => {
+  describe('with one attachment', () => {
+    it('sends it with the message as its caption, as a single post', async () => {
       const chart = attachment('cpu.png', true);
-      const log = attachment('top.txt');
 
-      await expect(
-        service.send(['123'], 'CPU high', [chart, log]),
-      ).resolves.toEqual({
-        total: 1,
-        sent: 1,
-        failed: 0,
-        results: [{ chat_id: '123', success: true }],
-      });
-
-      expect(sendMessage).toHaveBeenCalledWith('123', 'CPU high');
-      // Photos show no file name, so it becomes the caption.
+      await expect(service.send(['123'], 'CPU high', [chart])).resolves.toEqual(
+        {
+          total: 1,
+          sent: 1,
+          failed: 0,
+          results: [{ chat_id: '123', success: true }],
+        },
+      );
       expect(sendPhoto).toHaveBeenCalledWith('123', chart, {
-        ...silentReply,
-        caption: 'cpu.png',
+        caption: 'CPU high',
       });
-      expect(sendDocument).toHaveBeenCalledWith('123', log, silentReply);
-      expect(sendMessage.mock.invocationCallOrder[0]).toBeLessThan(
-        sendPhoto.mock.invocationCallOrder[0],
-      );
-      expect(sendPhoto.mock.invocationCallOrder[0]).toBeLessThan(
-        sendDocument.mock.invocationCallOrder[0],
-      );
+      expect(sendMessage).not.toHaveBeenCalled();
     });
 
-    it('sends the attachments to every chat', async () => {
+    it('sends it to every chat', async () => {
       await expect(
         service.send(['1', '2'], 'CPU high', [attachment('top.txt')]),
       ).resolves.toMatchObject({ sent: 2 });
@@ -238,10 +225,161 @@ describe('NotificationsService', () => {
       ]);
     });
 
+    it('sends the message separately when it is too long for a caption', async () => {
+      const message = 'a'.repeat(1025);
+      const log = attachment('top.txt');
+
+      await service.send(['123'], message, [log]);
+
+      expect(sendMessage).toHaveBeenCalledWith('123', message);
+      expect(sendDocument).toHaveBeenCalledWith('123', log, {
+        replyToMessageId: MESSAGE_ID,
+        silent: true,
+      });
+    });
+
+    it('sends an image as a file with the caption when Telegram refuses it as a photo', async () => {
+      const screenshot = attachment('page.png', true);
+      sendPhoto.mockRejectedValue(
+        new TelegramApiError(
+          'rejected',
+          'Telegram API error 400: Bad Request: PHOTO_INVALID_DIMENSIONS',
+        ),
+      );
+
+      await expect(
+        service.send(['123'], 'Page broken', [screenshot]),
+      ).resolves.toMatchObject({ sent: 1, failed: 0 });
+      expect(sendDocument).toHaveBeenCalledWith('123', screenshot, {
+        caption: 'Page broken',
+      });
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('still sends the message as text when Telegram refuses the file', async () => {
+      sendDocument.mockRejectedValue(
+        new TelegramApiError(
+          'rejected',
+          'Telegram API error 400: Bad Request: file must be non-empty',
+        ),
+      );
+
+      await expect(
+        service.send(['123'], 'CPU high', [attachment('top.txt')]),
+      ).resolves.toMatchObject({
+        results: [
+          {
+            chat_id: '123',
+            success: false,
+            error:
+              'Attachment 1 ("top.txt"): Telegram API error 400: Bad Request: file must be non-empty',
+          },
+        ],
+      });
+      expect(sendMessage).toHaveBeenCalledWith('123', 'CPU high');
+    });
+
+    it('reports the message error when the text fallback fails too', async () => {
+      const notFound = new TelegramApiError(
+        'rejected',
+        'Telegram API error 400: Bad Request: chat not found',
+      );
+      sendDocument.mockRejectedValue(notFound);
+      sendMessage.mockRejectedValue(notFound);
+
+      await expect(
+        service.send(['123'], 'CPU high', [attachment('top.txt')]),
+      ).resolves.toMatchObject({
+        results: [{ chat_id: '123', success: false, error: notFound.message }],
+      });
+    });
+
+    it.each([
+      new TelegramApiError(
+        'timeout',
+        'Telegram did not respond within 10000 ms; delivery could not be confirmed',
+      ),
+      new TelegramApiError(
+        'rate_limited',
+        'Rate limited by Telegram; retry after 30 seconds',
+        30,
+      ),
+    ])('sends nothing more after a $reason failure', async (error) => {
+      sendPhoto.mockRejectedValue(error);
+
+      await expect(
+        service.send(['123'], 'CPU high', [attachment('cpu.png', true)]),
+      ).resolves.toMatchObject({
+        results: [
+          {
+            chat_id: '123',
+            success: false,
+            error: `Attachment 1 ("cpu.png"): ${error.message}`,
+          },
+        ],
+      });
+      // Delivery is unconfirmed, so resending could duplicate the alert.
+      expect(sendDocument).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('hides unexpected errors behind a generic message', async () => {
+      sendDocument.mockRejectedValue(new Error('internal detail'));
+
+      await expect(
+        service.send(['123'], 'CPU high', [attachment('top.txt')]),
+      ).resolves.toMatchObject({
+        results: [
+          {
+            chat_id: '123',
+            success: false,
+            error:
+              'Attachment 1 ("top.txt"): Unexpected error while sending the file',
+          },
+        ],
+      });
+    });
+
+    it('reports a server error when Telegram rejects the bot token during an upload', async () => {
+      sendDocument.mockRejectedValue(
+        new TelegramApiError('unauthorized', 'Telegram rejected the bot token'),
+      );
+
+      await expect(
+        service.send(['123'], 'CPU high', [attachment('top.txt')]),
+      ).rejects.toThrow(InternalServerErrorException);
+    });
+  });
+
+  describe('with several attachments', () => {
+    const silentReply = { replyToMessageId: MESSAGE_ID, silent: true };
+
+    it('sends the message, then each attachment as an uncaptioned silent reply', async () => {
+      const chart = attachment('cpu.png', true);
+      const log = attachment('top.txt');
+
+      await expect(
+        service.send(['123'], 'CPU high', [chart, log]),
+      ).resolves.toMatchObject({ sent: 1, failed: 0 });
+
+      expect(sendMessage).toHaveBeenCalledWith('123', 'CPU high');
+      expect(sendPhoto).toHaveBeenCalledWith('123', chart, silentReply);
+      expect(sendDocument).toHaveBeenCalledWith('123', log, silentReply);
+      expect(sendMessage.mock.invocationCallOrder[0]).toBeLessThan(
+        sendPhoto.mock.invocationCallOrder[0],
+      );
+      expect(sendPhoto.mock.invocationCallOrder[0]).toBeLessThan(
+        sendDocument.mock.invocationCallOrder[0],
+      );
+    });
+
     it('sends attachments without a reply when the message ID is unknown', async () => {
       sendMessage.mockResolvedValue(undefined);
 
-      await service.send(['123'], 'CPU high', [attachment('top.txt')]);
+      await service.send(['123'], 'CPU high', [
+        attachment('a.txt'),
+        attachment('b.txt'),
+      ]);
 
       expect(sendDocument).toHaveBeenCalledWith('123', expect.anything(), {
         replyToMessageId: undefined,
@@ -259,40 +397,10 @@ describe('NotificationsService', () => {
       );
 
       await expect(
-        service.send(['123'], 'Page broken', [screenshot]),
+        service.send(['123'], 'Page broken', [screenshot, attachment('a.txt')]),
       ).resolves.toMatchObject({ sent: 1, failed: 0 });
       expect(sendDocument).toHaveBeenCalledWith('123', screenshot, silentReply);
     });
-
-    it.each([
-      new TelegramApiError(
-        'timeout',
-        'Telegram did not respond within 10000 ms; delivery could not be confirmed',
-      ),
-      new TelegramApiError(
-        'rate_limited',
-        'Rate limited by Telegram; retry after 30 seconds',
-        30,
-      ),
-    ])(
-      'does not resend a photo as a file after a $reason failure',
-      async (error) => {
-        sendPhoto.mockRejectedValue(error);
-
-        await expect(
-          service.send(['123'], 'CPU high', [attachment('cpu.png', true)]),
-        ).resolves.toMatchObject({
-          results: [
-            {
-              chat_id: '123',
-              success: false,
-              error: `Attachment 1 ("cpu.png"): ${error.message}`,
-            },
-          ],
-        });
-        expect(sendDocument).not.toHaveBeenCalled();
-      },
-    );
 
     it('stops at the first failed attachment and names it in the error', async () => {
       sendDocument.mockImplementation(async (_chatId, file) => {
@@ -339,7 +447,10 @@ describe('NotificationsService', () => {
       );
 
       await expect(
-        service.send(['123'], 'CPU high', [attachment('top.txt')]),
+        service.send(['123'], 'CPU high', [
+          attachment('a.txt'),
+          attachment('b.txt'),
+        ]),
       ).resolves.toMatchObject({
         results: [
           {
@@ -351,33 +462,6 @@ describe('NotificationsService', () => {
         ],
       });
       expect(sendDocument).not.toHaveBeenCalled();
-    });
-
-    it('hides unexpected attachment errors behind a generic message', async () => {
-      sendDocument.mockRejectedValue(new Error('internal detail'));
-
-      await expect(
-        service.send(['123'], 'CPU high', [attachment('top.txt')]),
-      ).resolves.toMatchObject({
-        results: [
-          {
-            chat_id: '123',
-            success: false,
-            error:
-              'Attachment 1 ("top.txt"): Unexpected error while sending the file',
-          },
-        ],
-      });
-    });
-
-    it('reports a server error when Telegram rejects the bot token during an upload', async () => {
-      sendDocument.mockRejectedValue(
-        new TelegramApiError('unauthorized', 'Telegram rejected the bot token'),
-      );
-
-      await expect(
-        service.send(['123'], 'CPU high', [attachment('top.txt')]),
-      ).rejects.toThrow(InternalServerErrorException);
     });
   });
 });
