@@ -4,9 +4,14 @@ import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module.js';
 import type { EnvironmentVariables } from './config/env.validation.js';
+import { ErrorFileLogger } from './logging/error-file.logger.js';
 
 async function bootstrap() {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  // Startup logs are held until the error file logger is ready.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bufferLogs: true,
+  });
+  app.useLogger(app.get(ErrorFileLogger));
   app.disable('x-powered-by');
   app.enableShutdownHooks();
 

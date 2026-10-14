@@ -13,6 +13,9 @@ describe('validateEnv', () => {
       MAX_ATTACHMENTS_PER_REQUEST: 5,
       MAX_ATTACHMENT_SIZE_MB: 10,
       TELEGRAM_REQUEST_TIMEOUT_MS: 10_000,
+      TELEGRAM_MAX_RETRIES: 3,
+      ERROR_LOG_DIR: 'logs',
+      ERROR_LOG_RETENTION_DAYS: 30,
       RATE_LIMIT_TTL_MS: 60_000,
       RATE_LIMIT_MAX_REQUESTS: 10,
     });
@@ -56,6 +59,9 @@ describe('validateEnv', () => {
     ['MAX_ATTACHMENT_SIZE_MB', '2.5'],
     ['PORT', '70000'],
     ['TELEGRAM_REQUEST_TIMEOUT_MS', '10'],
+    ['TELEGRAM_MAX_RETRIES', '-1'],
+    ['TELEGRAM_MAX_RETRIES', '11'],
+    ['ERROR_LOG_RETENTION_DAYS', '0'],
     ['RATE_LIMIT_MAX_REQUESTS', '0'],
   ])('rejects %s=%j', (name, value) => {
     expect(() =>

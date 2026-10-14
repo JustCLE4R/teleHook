@@ -2,7 +2,14 @@
 // rather than relying on Nest having been imported first.
 import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
-import { IsInt, Matches, Max, Min, validateSync } from 'class-validator';
+import {
+  IsInt,
+  IsString,
+  Matches,
+  Max,
+  Min,
+  validateSync,
+} from 'class-validator';
 
 // class-validator checks decorators bottom-up and stops at the first failure,
 // so type checks sit closest to each property.
@@ -39,6 +46,21 @@ export class EnvironmentVariables {
   @Min(1_000)
   @IsInt()
   TELEGRAM_REQUEST_TIMEOUT_MS: number = 10_000;
+
+  // Retries after a failed Telegram call; 0 disables retrying.
+  @Max(10)
+  @Min(0)
+  @IsInt()
+  TELEGRAM_MAX_RETRIES: number = 3;
+
+  // Directory for the warning and error log files; empty disables them.
+  @IsString()
+  ERROR_LOG_DIR: string = 'logs';
+
+  @Max(3650)
+  @Min(1)
+  @IsInt()
+  ERROR_LOG_RETENTION_DAYS: number = 30;
 
   @Min(1_000)
   @IsInt()

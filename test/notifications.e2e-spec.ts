@@ -4,6 +4,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types.js';
 import type { Mock } from 'vitest';
 import { AppModule } from '../src/app.module.js';
+import { currentRequestId } from '../src/logging/request-context.js';
 
 // Matches the environment in vitest.config.e2e.ts.
 const TOKEN = '123456789:e2e-test-token';
@@ -199,7 +200,66 @@ describe('POST /api/send (e2e)', () => {
     ]);
   });
 
-  it('reports network failures and timeouts for each chat', async () => {
+  describe('request IDs', () => {
+    const UUID =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const body = { chat_ids: ['123'], message: 'Hello' };
+
+    it('returns a new request ID', async () => {
+      const res = await post(body).expect(200);
+
+      expect(res.headers['x-request-id']).toMatch(UUID);
+    });
+
+    it("keeps the caller's request ID", async () => {
+      const res = await post(body)
+        .set('X-Request-Id', 'cpu-check.42')
+        .expect(200);
+
+      expect(res.headers['x-request-id']).toBe('cpu-check.42');
+    });
+
+    it('replaces a request ID that could forge log content', async () => {
+      const res = await post(body)
+        .set('X-Request-Id', 'x" {"level":"error"}')
+        .expect(200);
+
+      expect(res.headers['x-request-id']).toMatch(UUID);
+    });
+
+    it('tags the logs written while handling the request', async () => {
+      const seen: (string | undefined)[] = [];
+      vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => {
+        seen.push(currentRequestId());
+      });
+      fetchMock.mockImplementation(async () => {
+        throw new TypeError('fetch failed');
+      });
+
+      const res = await postForm()
+        .field('chat_ids', '123')
+        .field('message', 'Hello')
+        .attach('files', Buffer.from('x'), 'top.txt')
+        .expect(207);
+
+      expect(seen.length).toBeGreaterThan(0);
+      expect(new Set(seen)).toEqual(new Set([res.headers['x-request-id']]));
+    });
+  });
+
+  it('retries a dropped connection and delivers', async () => {
+    vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    fetchMock
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockImplementation(async () => delivered());
+
+    await post({ chat_ids: ['1'], message: 'Hello' }).expect(200);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports network failures and timeouts that outlast the retries', async () => {
+    vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     fetchMock.mockImplementation(async (_url, init) => {
       if (chatIdOf(init) === '1') {
         throw new TypeError('fetch failed');
@@ -215,15 +275,18 @@ describe('POST /api/send (e2e)', () => {
       {
         chat_id: '1',
         success: false,
-        error: 'Could not reach Telegram; delivery could not be confirmed',
+        error:
+          'Could not reach Telegram; delivery could not be confirmed (after 2 attempts)',
       },
       {
         chat_id: '2',
         success: false,
         error:
-          'Telegram did not respond within 1000 ms; delivery could not be confirmed',
+          'Telegram did not respond within 1000 ms; delivery could not be confirmed (after 2 attempts)',
       },
     ]);
+    // One retry each, as configured in vitest.config.e2e.ts.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it('responds 500 without exposing the token when Telegram rejects it', async () => {

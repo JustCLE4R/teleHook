@@ -125,10 +125,15 @@ export class NotificationsService {
       await this.sendAttachment(chatId, attachment, { caption: message });
       return { chat_id: chatId, success: true };
     } catch (error) {
-      if (!isRefusal(error)) {
+      if (
+        error instanceof TelegramApiError &&
+        error.reason === 'unauthorized'
+      ) {
         return this.failure(chatId, error, attachmentLabel(0, attachment));
       }
-      // Nothing was sent, so the alert itself can still go out as text.
+      // The alert must get through, so send it as text on its own. If the
+      // upload timed out, the captioned file may have arrived after all; a
+      // duplicate alert is better than a lost one.
       try {
         await this.telegram.sendMessage(chatId, message);
       } catch (messageError) {

@@ -8,10 +8,12 @@ const TOKEN = '123456789:unit-test-token';
 const BOT_URL = `https://api.telegram.org/bot${TOKEN}`;
 const SEND_MESSAGE_URL = `${BOT_URL}/sendMessage`;
 
-function createService(timeoutMs = 1_000): TelegramService {
+/** Retries are off unless a test asks for them. */
+function createService(timeoutMs = 1_000, maxRetries = 0): TelegramService {
   const values: Partial<EnvironmentVariables> = {
     TELEGRAM_BOT_TOKEN: TOKEN,
     TELEGRAM_REQUEST_TIMEOUT_MS: timeoutMs,
+    TELEGRAM_MAX_RETRIES: maxRetries,
   };
   const config = { get: (key: keyof EnvironmentVariables) => values[key] };
   return new TelegramService(
@@ -205,70 +207,7 @@ describe('TelegramService', () => {
     });
   });
 
-  describe('when rate limited (HTTP 429)', () => {
-    beforeEach(() => {
-      vi.useFakeTimers({ toFake: ['setTimeout'] });
-    });
-
-    it('waits retry_after seconds, then retries once', async () => {
-      fetchMock
-        .mockResolvedValueOnce(rateLimited(2))
-        .mockResolvedValueOnce(delivered());
-
-      const sending = createService().sendMessage('123', 'hi');
-      await vi.advanceTimersByTimeAsync(1_999);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      await vi.advanceTimersByTimeAsync(1);
-
-      await expect(sending).resolves.toBe(1);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    });
-
-    it('uploads the file again on the retry', async () => {
-      fetchMock
-        .mockResolvedValueOnce(rateLimited(1))
-        .mockResolvedValueOnce(delivered());
-
-      const sending = createService().sendDocument('123', report());
-      await vi.advanceTimersByTimeAsync(1_000);
-
-      await expect(sending).resolves.toBe(1);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      for (const [url, init] of fetchMock.mock.calls) {
-        expect(url).toBe(`${BOT_URL}/sendDocument`);
-        await expect(formFields(init)).resolves.toMatchObject({
-          document: { filename: 'top.txt', text: 'load average: 9.87' },
-        });
-      }
-    });
-
-    it('gives up when the retry is rate limited too', async () => {
-      fetchMock.mockImplementation(async () => rateLimited(1));
-
-      const outcome = expect(
-        createService().sendMessage('123', 'hi'),
-      ).rejects.toMatchObject({ reason: 'rate_limited' });
-      await vi.advanceTimersByTimeAsync(1_000);
-
-      await outcome;
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    });
-
-    it('fails without waiting when retry_after is too long', async () => {
-      fetchMock.mockResolvedValue(rateLimited(30));
-
-      await expect(
-        createService().sendMessage('123', 'hi'),
-      ).rejects.toMatchObject({
-        reason: 'rate_limited',
-        message: 'Rate limited by Telegram; retry after 30 seconds',
-        retryAfterSeconds: 30,
-      });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  it('does not retry Telegram server errors', async () => {
+  it('reports Telegram server errors', async () => {
     fetchMock.mockResolvedValue(
       new Response('<html>Bad Gateway</html>', { status: 502 }),
     );
@@ -291,7 +230,7 @@ describe('TelegramService', () => {
     ).rejects.toMatchObject({ reason: 'invalid_response' });
   });
 
-  it('reports network failures without retrying or logging the token', async () => {
+  it('reports network failures without logging the token', async () => {
     const warn = vi
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
@@ -313,7 +252,7 @@ describe('TelegramService', () => {
     );
   });
 
-  it('times out slow requests without retrying', async () => {
+  it('times out slow requests', async () => {
     fetchMock.mockImplementation(
       (_url, init) =>
         new Promise<Response>((_resolve, reject) => {
@@ -331,5 +270,172 @@ describe('TelegramService', () => {
         'Telegram did not respond within 20 ms; delivery could not be confirmed',
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails without retrying when retries are disabled', async () => {
+    fetchMock.mockResolvedValue(rateLimited(1));
+
+    await expect(
+      createService().sendMessage('123', 'hi'),
+    ).rejects.toMatchObject({
+      reason: 'rate_limited',
+      message: 'Rate limited by Telegram; retry after 1 seconds',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  describe('with retries', () => {
+    const resetByPeer = () =>
+      new TypeError('fetch failed', {
+        cause: Object.assign(new Error('read ECONNRESET'), {
+          code: 'ECONNRESET',
+        }),
+      });
+
+    let warn: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout'] });
+      warn = vi
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+    });
+
+    it('retries a dropped connection after 1 second', async () => {
+      fetchMock
+        .mockRejectedValueOnce(resetByPeer())
+        .mockResolvedValueOnce(delivered());
+
+      const sending = createService(1_000, 3).sendMessage('123', 'hi');
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(sending).resolves.toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledWith(
+        'sendMessage failed (Could not reach Telegram; delivery could not be confirmed); retry 1 of 3 in 1000 ms',
+      );
+    });
+
+    it.each([
+      ['a server error', () => new Response('Bad Gateway', { status: 502 })],
+      ['a response that is not Telegram JSON', () => new Response('OK')],
+    ])('retries after %s', async (_case, response) => {
+      fetchMock
+        .mockResolvedValueOnce(response())
+        .mockResolvedValueOnce(delivered());
+
+      const sending = createService(1_000, 3).sendMessage('123', 'hi');
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(sending).resolves.toBe(1);
+    });
+
+    it('doubles the wait for each retry, then reports the attempts', async () => {
+      fetchMock.mockRejectedValue(resetByPeer());
+
+      const outcome = expect(
+        createService(1_000, 3).sendMessage('123', 'hi'),
+      ).rejects.toMatchObject({
+        reason: 'network_error',
+        message:
+          'Could not reach Telegram; delivery could not be confirmed (after 4 attempts)',
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(4_000);
+
+      await outcome;
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    });
+
+    it('retries a timed-out request', async () => {
+      fetchMock
+        .mockRejectedValueOnce(
+          new DOMException('The operation timed out', 'TimeoutError'),
+        )
+        .mockResolvedValueOnce(delivered());
+
+      const sending = createService(1_000, 1).sendMessage('123', 'hi');
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(sending).resolves.toBe(1);
+    });
+
+    it('waits retry_after seconds when rate limited', async () => {
+      fetchMock
+        .mockResolvedValueOnce(rateLimited(2))
+        .mockResolvedValueOnce(delivered());
+
+      const sending = createService(1_000, 3).sendMessage('123', 'hi');
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(sending).resolves.toBe(1);
+    });
+
+    it('fails without waiting when retry_after is longer than 30 seconds', async () => {
+      fetchMock.mockResolvedValue(rateLimited(31));
+
+      await expect(
+        createService(1_000, 3).sendMessage('123', 'hi'),
+      ).rejects.toMatchObject({
+        reason: 'rate_limited',
+        message: 'Rate limited by Telegram; retry after 31 seconds',
+        retryAfterSeconds: 31,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('uploads the file again on a retry', async () => {
+      fetchMock
+        .mockRejectedValueOnce(resetByPeer())
+        .mockResolvedValueOnce(delivered());
+
+      const sending = createService(1_000, 3).sendDocument('123', report());
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(sending).resolves.toBe(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      for (const [url, init] of fetchMock.mock.calls) {
+        expect(url).toBe(`${BOT_URL}/sendDocument`);
+        await expect(formFields(init)).resolves.toMatchObject({
+          document: { filename: 'top.txt', text: 'load average: 9.87' },
+        });
+      }
+    });
+
+    it.each([
+      ['a refusal', () => failure(400, 'Bad Request: chat not found')],
+      ['a rejected bot token', () => failure(401, 'Unauthorized')],
+    ])('does not retry %s', async (_case, response) => {
+      fetchMock.mockResolvedValue(response());
+
+      await expect(
+        createService(1_000, 3).sendMessage('123', 'hi'),
+      ).rejects.toBeInstanceOf(Error);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a refusal that follows a retry with the attempt count', async () => {
+      fetchMock
+        .mockRejectedValueOnce(resetByPeer())
+        .mockResolvedValueOnce(failure(400, 'Bad Request: chat not found'));
+
+      const outcome = expect(
+        createService(1_000, 3).sendMessage('123', 'hi'),
+      ).rejects.toMatchObject({
+        reason: 'rejected',
+        message:
+          'Telegram API error 400: Bad Request: chat not found (after 2 attempts)',
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await outcome;
+    });
   });
 });

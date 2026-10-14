@@ -23,16 +23,19 @@ Then set `TELEGRAM_BOT_TOKEN` in `.env`. The `.env` file is git-ignored; only `.
 
 ## Configuration
 
-| Variable                      | Default  | Description                                                                       |
-| ----------------------------- | -------- | --------------------------------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN`          | required | Bot token from @BotFather (`<bot id>:<secret>`)                                   |
-| `PORT`                        | `3000`   | HTTP port                                                                         |
-| `MAX_RECIPIENTS_PER_REQUEST`  | `20`     | Maximum chat IDs per request (1–100)                                              |
-| `MAX_ATTACHMENTS_PER_REQUEST` | `5`      | Maximum files per request (1–10)                                                  |
-| `MAX_ATTACHMENT_SIZE_MB`      | `10`     | Maximum size of each file, in MB (1–50; Telegram accepts bot uploads up to 50 MB) |
-| `TELEGRAM_REQUEST_TIMEOUT_MS` | `10000`  | Timeout for each Telegram API call, including each file upload (1000–60000)       |
-| `RATE_LIMIT_TTL_MS`           | `60000`  | Rate-limit window                                                                 |
-| `RATE_LIMIT_MAX_REQUESTS`     | `10`     | Requests allowed per client IP per window                                         |
+| Variable                      | Default  | Description                                                                                     |
+| ----------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`          | required | Bot token from @BotFather (`<bot id>:<secret>`)                                                 |
+| `PORT`                        | `3000`   | HTTP port                                                                                       |
+| `MAX_RECIPIENTS_PER_REQUEST`  | `20`     | Maximum chat IDs per request (1–100)                                                            |
+| `MAX_ATTACHMENTS_PER_REQUEST` | `5`      | Maximum files per request (1–10)                                                                |
+| `MAX_ATTACHMENT_SIZE_MB`      | `10`     | Maximum size of each file, in MB (1–50; Telegram accepts bot uploads up to 50 MB)               |
+| `TELEGRAM_REQUEST_TIMEOUT_MS` | `10000`  | Timeout for each Telegram API call, including each file upload (1000–60000)                     |
+| `TELEGRAM_MAX_RETRIES`        | `3`      | Retries for each Telegram call that fails for a temporary reason (0–10; 0 disables retrying)    |
+| `ERROR_LOG_DIR`               | `logs`   | Directory for the [error log](#error-log), relative to the working directory; empty disables it |
+| `ERROR_LOG_RETENTION_DAYS`    | `30`     | Days of error log files to keep (1–3650)                                                        |
+| `RATE_LIMIT_TTL_MS`           | `60000`  | Rate-limit window                                                                               |
+| `RATE_LIMIT_MAX_REQUESTS`     | `10`     | Requests allowed per client IP per window                                                       |
 
 Variables are validated at startup. If one is missing or invalid, the app exits with code 1 and a message naming the variable. The token value is never printed. Real environment variables take precedence over values in `.env`.
 
@@ -83,7 +86,7 @@ curl http://localhost:3000/api/send \
 | `message`  | As in JSON. Required, also when files are attached.                                                                                                                   |
 | `files`    | Optional. Up to `MAX_ATTACHMENTS_PER_REQUEST` files (default 5), one `files` field each. Each must be non-empty and at most `MAX_ATTACHMENT_SIZE_MB` (default 10 MB). |
 
-**One file:** each chat receives a single post, the file with the message as its caption. Telegram limits captions to 1024 characters, so a longer message is sent as with several files. If Telegram refuses the file, the message is still sent as text, and the result reports the file's error.
+**One file:** each chat receives a single post, the file with the message as its caption. Telegram limits captions to 1024 characters, so a longer message is sent as with several files. If the file cannot be delivered, even after retries, the message is still sent as text, and the result reports the file's error.
 
 **Several files:** each chat receives:
 
@@ -226,18 +229,60 @@ Common per-chat `error` values:
 | `Telegram API error 400: Bad Request: chat not found`                       | Wrong ID, or the bot has never had access to that chat                                   |
 | `Telegram API error 403: Forbidden: bot was blocked by the user`            | The user blocked the bot                                                                 |
 | `Rate limited by Telegram; retry after N seconds`                           | Not delivered; safe to retry after N seconds                                             |
-| `Telegram did not respond within 10000 ms; delivery could not be confirmed` | May or may not have been delivered; a retry could send a duplicate                       |
-| `Could not reach Telegram; delivery could not be confirmed`                 | Network failure; may or may not have been delivered                                      |
+| `Telegram did not respond within 10000 ms; delivery could not be confirmed` | Still failing after all retries; may or may not have been delivered                      |
+| `Could not reach Telegram; delivery could not be confirmed`                 | Network failure that outlasted the retries; may or may not have been delivered           |
 | `Attachment 2 ("top.txt"): <one of the errors above>`                       | The message and the files before this one were delivered; later files were not attempted |
 
 ### Delivery behaviour
 
 - Up to 5 chats are served at a time. Each chat receives its message and files one after another. Results are returned in request order.
 - A failed chat never stops delivery to the other chats.
-- Within a chat, delivery stops at the first failure. Everything before the failed item was delivered, and its error names the file if it was not the message. With a single captioned file, `Attachment 1 (...)` means the message went out as text after Telegram refused the file, unless the upload timed out or failed in transit, in which case nothing more is sent.
-- Only HTTP 429 is retried, because Telegram guarantees a rate-limited message was not sent. It is retried once, after the `retry_after` delay, and only if that delay is 5 seconds or less. Longer waits fail that chat immediately with the retry time. Uploads follow the same rule.
-- Timeouts, network errors and Telegram 5xx responses are never retried. The message or file may already have been delivered, so the caller decides whether to resend. `TELEGRAM_REQUEST_TIMEOUT_MS` applies to each upload too; raise it if large files time out on a slow link.
+- Within a chat, delivery stops at the first failure. Everything before the failed item was delivered, and its error names the file if it was not the message. With a single captioned file, `Attachment 1 (...)` means the file failed and the message was then sent as text.
+- Calls that fail for a temporary reason are retried up to `TELEGRAM_MAX_RETRIES` times (default 3): dropped connections such as `ECONNRESET`, timeouts, Telegram 5xx responses and unreadable responses wait 1, 2, then 4 seconds; HTTP 429 waits the `retry_after` Telegram asks for, if that is 30 seconds or less. A final failure says how many attempts were made, e.g. `(after 4 attempts)`. Refusals, such as an unknown chat, are never retried.
+- **Retries favour delivery over uniqueness.** After a timeout or dropped connection the message may already have arrived, so a retry can deliver it twice. For alerts, a duplicate is better than a lost message. Set `TELEGRAM_MAX_RETRIES=0` to never risk duplicates.
+- Retries keep the HTTP request open: with the defaults, one Telegram call can take up to about 47 seconds (4 attempts of 10 seconds plus 7 seconds of waiting). Give callers a generous timeout. `TELEGRAM_REQUEST_TIMEOUT_MS` applies to each upload too; raise it if large files time out on a slow link.
 - If Telegram rejects the bot token, the remaining chats are skipped and the API responds 500.
+
+## Error log
+
+Warnings and errors are printed to the console as before, and also appended to a daily file in `ERROR_LOG_DIR`, `errors-YYYY-MM-DD.jsonl` (UTC dates), one JSON object per line. Files older than `ERROR_LOG_RETENTION_DAYS` are deleted. If the file cannot be written, this is reported once on stderr and the service keeps running.
+
+```json
+{
+  "time": "2026-10-14T22:56:00.161Z",
+  "level": "warn",
+  "context": "TelegramService",
+  "request_id": "cpu-check-web1",
+  "message": "sendPhoto failed (Could not reach Telegram; delivery could not be confirmed); retry 2 of 3 in 2000 ms"
+}
+```
+
+| Field        | Meaning                                                                                   |
+| ------------ | ----------------------------------------------------------------------------------------- |
+| `time`       | When it happened (UTC)                                                                    |
+| `level`      | `warn` for retries and failed deliveries, `error` for configuration and unexpected errors |
+| `context`    | The part of the service that logged it, e.g. `TelegramService`                            |
+| `request_id` | The API request it belongs to; absent for startup messages                                |
+| `message`    | What went wrong. Never contains the bot token, message text or file contents              |
+| `stack`      | Stack trace, for unexpected errors                                                        |
+
+Every response carries an `X-Request-Id` header with the ID that its log lines use. Send your own `X-Request-Id` (letters, digits, `_`, `.` and `-`, up to 64 characters), such as the name of the check, to find a request's lines later; other values are replaced by a generated ID.
+
+Summaries with [jq](https://jqlang.org/), to see what fails most and where to improve:
+
+```bash
+# Most frequent problems, with numbers blanked out so similar lines group together
+jq -r '.message | gsub("[0-9]+"; "N")' logs/errors-*.jsonl | sort | uniq -c | sort -rn | head
+
+# Network errors per hour, such as ECONNRESET
+jq -r 'select(.message | startswith("Request to Telegram failed")) | .time[0:13] + " " + .message' logs/errors-*.jsonl | sort | uniq -c
+
+# Everything that happened during one request
+jq 'select(.request_id == "cpu-check-web1")' logs/errors-*.jsonl
+
+# Deliveries that failed after all retries
+jq -r 'select(.message | startswith("Delivery to chat")) | .time + " " + .message' logs/errors-*.jsonl
+```
 
 ## Telegram setup
 
@@ -295,7 +340,7 @@ Built-in safeguards:
 - **Per-IP rate limit**, 10 requests per minute by default. Counters live in memory, so they reset on restart and are not shared between instances. Behind a reverse proxy, all clients share the proxy's IP, and therefore one limit, unless Express's `trust proxy` setting is enabled (for example `app.set('trust proxy', 1)` in `src/main.ts`). Enable it only when a proxy you control is in front: otherwise clients can spoof `X-Forwarded-For` to evade the limit.
 - **No cross-site browser requests.** HTML forms can post multipart bodies to any site without a CORS preflight, so without this check any web page could make a visitor's browser send messages through an instance on their network. Browsers mark such requests with the `Sec-Fetch-Site` or `Origin` header, and the API rejects them with 403. curl and server-side HTTP clients send neither header. Bodies other than JSON and multipart get 415, and CORS is not enabled, so browsers also block cross-origin JSON requests.
 - **Strict validation.** The number of recipients and files and the size of each file are limited, unknown fields are rejected, and messages are sent as plain text. Lower `MAX_ATTACHMENTS_PER_REQUEST` and `MAX_ATTACHMENT_SIZE_MB` on servers with little memory.
-- **Token handling.** The token is read only from the environment and validated at startup. It never appears in responses or logs. Failed deliveries are logged with the chat ID, the reason and the file name if a file failed, never the message text or file contents.
+- **Token handling.** The token is read only from the environment and validated at startup. It never appears in responses or logs. Failed deliveries are logged, to the console and the error log, with the chat ID, the reason and the file name if a file failed, never the message text or file contents. Chat IDs and file names do appear in the error log, so restrict access to `ERROR_LOG_DIR`.
 
 ## Project structure
 
@@ -305,6 +350,10 @@ src/
 ├── app.module.ts                    # configuration, rate limiter, global validation pipe
 ├── config/
 │   └── env.validation.ts            # environment schema, validated at startup
+├── logging/
+│   ├── error-file.logger.ts         # console logger that also writes the error log files
+│   ├── request-context.ts           # request IDs, shared with every log line of a request
+│   └── logging.module.ts
 ├── telegram/
 │   ├── telegram.module.ts
 │   └── telegram.service.ts          # Bot API client: messages and uploads, timeout, error mapping, 429 retry

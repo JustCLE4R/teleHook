@@ -17,6 +17,7 @@ export default defineConfig({
       MAX_ATTACHMENTS_PER_REQUEST: '3',
       MAX_ATTACHMENT_SIZE_MB: '1',
       TELEGRAM_REQUEST_TIMEOUT_MS: '1000',
+      TELEGRAM_MAX_RETRIES: '1',
       RATE_LIMIT_TTL_MS: '60000',
       RATE_LIMIT_MAX_REQUESTS: '5',
     },

@@ -304,24 +304,28 @@ describe('NotificationsService', () => {
         'Rate limited by Telegram; retry after 30 seconds',
         30,
       ),
-    ])('sends nothing more after a $reason failure', async (error) => {
-      sendPhoto.mockRejectedValue(error);
+    ])(
+      'still sends the message as text after a $reason failure',
+      async (error) => {
+        sendPhoto.mockRejectedValue(error);
 
-      await expect(
-        service.send(['123'], 'CPU high', [attachment('cpu.png', true)]),
-      ).resolves.toMatchObject({
-        results: [
-          {
-            chat_id: '123',
-            success: false,
-            error: `Attachment 1 ("cpu.png"): ${error.message}`,
-          },
-        ],
-      });
-      // Delivery is unconfirmed, so resending could duplicate the alert.
-      expect(sendDocument).not.toHaveBeenCalled();
-      expect(sendMessage).not.toHaveBeenCalled();
-    });
+        await expect(
+          service.send(['123'], 'CPU high', [attachment('cpu.png', true)]),
+        ).resolves.toMatchObject({
+          results: [
+            {
+              chat_id: '123',
+              success: false,
+              error: `Attachment 1 ("cpu.png"): ${error.message}`,
+            },
+          ],
+        });
+        // The photo may have arrived, so it is not resent as a file, but the
+        // alert text goes out: a duplicate beats a lost alert.
+        expect(sendDocument).not.toHaveBeenCalled();
+        expect(sendMessage).toHaveBeenCalledWith('123', 'CPU high');
+      },
+    );
 
     it('hides unexpected errors behind a generic message', async () => {
       sendDocument.mockRejectedValue(new Error('internal detail'));

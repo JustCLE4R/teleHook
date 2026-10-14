@@ -6,6 +6,7 @@ import {
   type EnvironmentVariables,
   validateEnv,
 } from './config/env.validation.js';
+import { LoggingModule } from './logging/logging.module.js';
 import { NotificationsModule } from './notifications/notifications.module.js';
 
 @Module({
@@ -23,6 +24,7 @@ import { NotificationsModule } from './notifications/notifications.module.js';
         errorMessage: 'Too many requests, please try again later',
       }),
     }),
+    LoggingModule,
     NotificationsModule,
   ],
   providers: [

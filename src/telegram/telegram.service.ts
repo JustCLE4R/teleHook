@@ -5,7 +5,10 @@ import type { EnvironmentVariables } from '../config/env.validation.js';
 const TELEGRAM_API_URL = 'https://api.telegram.org';
 
 /** Rate-limit waits longer than this fail fast instead of holding the HTTP request open. */
-const MAX_RETRY_AFTER_SECONDS = 5;
+const MAX_RETRY_AFTER_SECONDS = 30;
+
+/** Wait before the first retry; it doubles for each further retry. */
+const RETRY_BASE_DELAY_MS = 1_000;
 
 export type TelegramFailureReason =
   // The bot token was rejected: a server configuration problem.
@@ -58,11 +61,13 @@ export class TelegramService {
   private readonly logger = new Logger(TelegramService.name);
   private readonly botUrl: string;
   private readonly timeoutMs: number;
+  private readonly maxRetries: number;
 
   constructor(config: ConfigService<EnvironmentVariables, true>) {
     const token = config.get('TELEGRAM_BOT_TOKEN', { infer: true });
     this.botUrl = `${TELEGRAM_API_URL}/bot${token}`;
     this.timeoutMs = config.get('TELEGRAM_REQUEST_TIMEOUT_MS', { infer: true });
+    this.maxRetries = config.get('TELEGRAM_MAX_RETRIES', { infer: true });
   }
 
   /**
@@ -97,22 +102,31 @@ export class TelegramService {
     );
   }
 
+  /**
+   * Posts to the Bot API, retrying transient failures up to maxRetries times.
+   *
+   * After a timeout or a dropped connection the message may already have
+   * been delivered, so a retry can send it twice. For alerts a duplicate is
+   * better than a lost message. Refusals are final and never retried.
+   */
   private async call(
     method: string,
     body: string | FormData,
   ): Promise<number | undefined> {
-    try {
-      return await this.post(method, body);
-    } catch (error) {
-      const retryAfter = retryableDelaySeconds(error);
-      if (retryAfter === undefined) {
-        throw error;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.post(method, body);
+      } catch (error) {
+        const delayMs =
+          attempt <= this.maxRetries ? retryDelayMs(error, attempt) : undefined;
+        if (delayMs === undefined) {
+          throw attempt > 1 ? withAttempts(error, attempt) : error;
+        }
+        this.logger.warn(
+          `${method} failed (${(error as Error).message}); retry ${attempt} of ${this.maxRetries} in ${delayMs} ms`,
+        );
+        await sleep(delayMs);
       }
-      // HTTP 429 means Telegram did not send the message, so a single delayed
-      // retry cannot create a duplicate. Nothing else is retried: after a
-      // timeout or network error the message may already have been delivered.
-      await sleep(retryAfter * 1000);
-      return this.post(method, body);
     }
   }
 
@@ -242,16 +256,41 @@ function toApiError(
   );
 }
 
-function retryableDelaySeconds(error: unknown): number | undefined {
-  if (
-    error instanceof TelegramApiError &&
-    error.reason === 'rate_limited' &&
-    error.retryAfterSeconds !== undefined &&
-    error.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS
-  ) {
-    return error.retryAfterSeconds;
+/** How long to wait before retrying after `error`, or undefined if it is final. */
+function retryDelayMs(error: unknown, attempt: number): number | undefined {
+  if (!(error instanceof TelegramApiError)) {
+    return undefined;
   }
-  return undefined;
+  switch (error.reason) {
+    case 'rate_limited':
+      if (error.retryAfterSeconds === undefined) {
+        break;
+      }
+      // Telegram did not send the message and says when to try again.
+      return error.retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS
+        ? error.retryAfterSeconds * 1000
+        : undefined;
+    case 'timeout':
+    case 'network_error':
+    case 'server_error':
+    case 'invalid_response':
+      break;
+    default:
+      // Refused or unauthorized: retrying would fail the same way.
+      return undefined;
+  }
+  return RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+}
+
+/** Notes in the message that the final failure followed retries. */
+function withAttempts(error: unknown, attempts: number): unknown {
+  return error instanceof TelegramApiError
+    ? new TelegramApiError(
+        error.reason,
+        `${error.message} (after ${attempts} attempts)`,
+        error.retryAfterSeconds,
+      )
+    : error;
 }
 
 function parseTelegramResponse(raw: string): TelegramApiResponse | undefined {
