@@ -19,10 +19,18 @@ const MAX_CONCURRENT_DELIVERIES = 5;
 /** Telegram's limit for a caption, in UTF-16 code units like the message. */
 const TELEGRAM_MAX_CAPTION_LENGTH = 1024;
 
+/** How warnings and errors refer to the message. */
+const MESSAGE = 'Message';
+
 export interface DeliveryResult {
   chat_id: string;
   success: boolean;
   error?: string;
+  /**
+   * Problems that did not stop delivery on their own, such as a retried
+   * attempt or a photo sent as a file. Present only when there were any.
+   */
+  warnings?: string[];
 }
 
 export interface DeliverySummary {
@@ -30,6 +38,29 @@ export interface DeliverySummary {
   sent: number;
   failed: number;
   results: DeliveryResult[];
+}
+
+/** The warnings collected while delivering to one chat. */
+class Warnings {
+  readonly list: string[] = [];
+
+  add(item: string, text: string): void {
+    this.list.push(`${item}: ${text}`);
+  }
+
+  /** Records attempts that failed before a later one, by their reasons. */
+  retried(item: string, failedAttempts: readonly string[]): void {
+    for (const [index, reason] of failedAttempts.entries()) {
+      this.add(item, `attempt ${index + 1} failed and was retried: ${reason}`);
+    }
+  }
+
+  /** Records the attempts before a final failure, which its error counts. */
+  retriedBefore(item: string, error: unknown): void {
+    if (error instanceof TelegramApiError) {
+      this.retried(item, error.failedAttempts);
+    }
+  }
 }
 
 @Injectable()
@@ -66,7 +97,18 @@ export class NotificationsService {
     const results = await mapWithConcurrency(
       chatIds,
       MAX_CONCURRENT_DELIVERIES,
-      (chatId) => this.deliver(chatId, message, attachments),
+      async (chatId) => {
+        const warnings = new Warnings();
+        const result = await this.deliver(
+          chatId,
+          message,
+          attachments,
+          warnings,
+        );
+        return warnings.list.length === 0
+          ? result
+          : { ...result, warnings: warnings.list };
+      },
     );
     const sent = results.filter((result) => result.success).length;
     return {
@@ -87,18 +129,22 @@ export class NotificationsService {
     chatId: string,
     message: string,
     attachments: readonly Attachment[],
+    warnings: Warnings,
   ): Promise<DeliveryResult> {
     if (
       attachments.length === 1 &&
       message.length <= TELEGRAM_MAX_CAPTION_LENGTH
     ) {
-      return this.deliverCaptioned(chatId, message, attachments[0]);
+      return this.deliverCaptioned(chatId, message, attachments[0], warnings);
     }
 
     let messageId: number | undefined;
     try {
-      messageId = await this.telegram.sendMessage(chatId, message);
+      const sent = await this.telegram.sendMessage(chatId, message);
+      warnings.retried(MESSAGE, sent.failedAttempts);
+      messageId = sent.messageId;
     } catch (error) {
+      warnings.retriedBefore(MESSAGE, error);
       return this.failure(chatId, error);
     }
 
@@ -106,10 +152,12 @@ export class NotificationsService {
     // each alert notifies only once.
     const options = { replyToMessageId: messageId, silent: true };
     for (const [index, attachment] of attachments.entries()) {
+      const item = attachmentLabel(index, attachment);
       try {
-        await this.sendAttachment(chatId, attachment, options);
+        await this.sendAttachment(chatId, attachment, options, item, warnings);
       } catch (error) {
-        return this.failure(chatId, error, attachmentLabel(index, attachment));
+        warnings.retriedBefore(item, error);
+        return this.failure(chatId, error, item);
       }
     }
     return { chat_id: chatId, success: true };
@@ -120,26 +168,41 @@ export class NotificationsService {
     chatId: string,
     message: string,
     attachment: Attachment,
+    warnings: Warnings,
   ): Promise<DeliveryResult> {
+    const item = attachmentLabel(0, attachment);
     try {
-      await this.sendAttachment(chatId, attachment, { caption: message });
+      await this.sendAttachment(
+        chatId,
+        attachment,
+        { caption: message },
+        item,
+        warnings,
+      );
       return { chat_id: chatId, success: true };
     } catch (error) {
+      warnings.retriedBefore(item, error);
       if (
         error instanceof TelegramApiError &&
         error.reason === 'unauthorized'
       ) {
-        return this.failure(chatId, error, attachmentLabel(0, attachment));
+        return this.failure(chatId, error, item);
       }
       // The alert must get through, so send it as text on its own. If the
       // upload timed out, the captioned file may have arrived after all; a
       // duplicate alert is better than a lost one.
       try {
-        await this.telegram.sendMessage(chatId, message);
+        const sent = await this.telegram.sendMessage(chatId, message);
+        warnings.retried(MESSAGE, sent.failedAttempts);
+        warnings.add(
+          MESSAGE,
+          'sent as text on its own because the file could not be delivered',
+        );
       } catch (messageError) {
+        warnings.retriedBefore(MESSAGE, messageError);
         return this.failure(chatId, messageError);
       }
-      return this.failure(chatId, error, attachmentLabel(0, attachment));
+      return this.failure(chatId, error, item);
     }
   }
 
@@ -147,24 +210,32 @@ export class NotificationsService {
     chatId: string,
     attachment: Attachment,
     options: SendFileOptions,
+    item: string,
+    warnings: Warnings,
   ): Promise<void> {
     if (attachment.isPhoto) {
       try {
-        await this.telegram.sendPhoto(chatId, attachment, options);
+        const sent = await this.telegram.sendPhoto(chatId, attachment, options);
+        warnings.retried(item, sent.failedAttempts);
         return;
       } catch (error) {
         // A refusal means nothing was sent, so the image can safely go out as
         // a file instead, for example when its aspect ratio is too extreme.
-        if (isRefusal(error)) {
-          this.logger.warn(
-            `Telegram refused "${attachment.filename}" as a photo for chat ${chatId}; sending it as a file: ${error.message}`,
-          );
-        } else {
+        if (!isRefusal(error)) {
           throw error;
         }
+        this.logger.warn(
+          `Telegram refused "${attachment.filename}" as a photo for chat ${chatId}; sending it as a file: ${error.message}`,
+        );
+        warnings.retriedBefore(item, error);
+        warnings.add(
+          item,
+          `sent as a file because Telegram refused it as a photo: ${error.message}`,
+        );
       }
     }
-    await this.telegram.sendDocument(chatId, attachment, options);
+    const sent = await this.telegram.sendDocument(chatId, attachment, options);
+    warnings.retried(item, sent.failedAttempts);
   }
 
   /** `item` names the attachment that failed, if it was not the message. */

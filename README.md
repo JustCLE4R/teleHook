@@ -140,16 +140,16 @@ curl -sS http://telehook.internal:3000/api/send \
 
 ### Status codes
 
-| Status | Meaning                                                                                                            |
-| ------ | ------------------------------------------------------------------------------------------------------------------ |
-| 200    | Every chat received the message and all files                                                                      |
-| 207    | At least one delivery failed (some or all). See `data.results` for the outcome of each chat                        |
-| 400    | Malformed JSON or form, failed validation, too many recipients or files, or an empty file                          |
-| 403    | A web browser sent the request on behalf of another site (see [Security considerations](#security-considerations)) |
-| 413    | A file is larger than `MAX_ATTACHMENT_SIZE_MB`                                                                     |
-| 415    | `Content-Type` is neither `application/json` nor `multipart/form-data`                                             |
-| 429    | Rate limit exceeded; the `Retry-After` header gives the wait in seconds                                            |
-| 500    | Telegram rejected the configured bot token, or an unexpected server error occurred                                 |
+| Status | Meaning                                                                                                                                                                      |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 200    | Every chat received the message and all files                                                                                                                                |
+| 207    | At least one delivery failed (some or all). See `data.results` for the outcome of each chat                                                                                  |
+| 400    | Malformed JSON or form, failed validation, too many recipients or files, or an empty file                                                                                    |
+| 403    | A web browser sent the request on behalf of another site (see [Security considerations](#security-considerations))                                                           |
+| 413    | A file is larger than `MAX_ATTACHMENT_SIZE_MB`                                                                                                                               |
+| 415    | `Content-Type` is neither `application/json` nor `multipart/form-data`                                                                                                       |
+| 429    | Rate limit exceeded. The `Retry-After` header gives the wait in seconds, and the message says it in words, e.g. `Too many requests, please try again in 1 minute 25 seconds` |
+| 500    | Telegram rejected the configured bot token, or an unexpected server error occurred                                                                                           |
 
 The top-level `success` field is `true` only when every delivery succeeded.
 
@@ -212,6 +212,33 @@ Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/send `
 }
 ```
 
+**200 with warnings: delivered, but not smoothly**
+
+A chat's result has a `warnings` list when something went wrong along the way without stopping delivery: an attempt that failed and was [retried](#delivery-behaviour), a photo sent as a file, or a message sent as text because its file could not be delivered. The list is left out when there is nothing to report. Failed deliveries can have warnings too, listing the attempts before the final one.
+
+```json
+{
+  "success": true,
+  "message": "Notification processing completed",
+  "data": {
+    "total": 1,
+    "sent": 1,
+    "failed": 0,
+    "results": [
+      {
+        "chat_id": "123456789",
+        "success": true,
+        "warnings": [
+          "Message: attempt 1 failed and was retried: Could not reach Telegram (ECONNRESET); delivery could not be confirmed"
+        ]
+      }
+    ]
+  }
+}
+```
+
+Warnings show a problem early, such as a flaky connection to Telegram, before it starts losing alerts. The same events are in the [error log](#error-log) with more detail.
+
 **400: validation error**
 
 ```json
@@ -224,14 +251,14 @@ Invoke-RestMethod -Method Post -Uri http://localhost:3000/api/send `
 
 Common per-chat `error` values:
 
-| Error                                                                       | What it means                                                                            |
-| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `Telegram API error 400: Bad Request: chat not found`                       | Wrong ID, or the bot has never had access to that chat                                   |
-| `Telegram API error 403: Forbidden: bot was blocked by the user`            | The user blocked the bot                                                                 |
-| `Rate limited by Telegram; retry after N seconds`                           | Not delivered; safe to retry after N seconds                                             |
-| `Telegram did not respond within 10000 ms; delivery could not be confirmed` | Still failing after all retries; may or may not have been delivered                      |
-| `Could not reach Telegram; delivery could not be confirmed`                 | Network failure that outlasted the retries; may or may not have been delivered           |
-| `Attachment 2 ("top.txt"): <one of the errors above>`                       | The message and the files before this one were delivered; later files were not attempted |
+| Error                                                                       | What it means                                                                                                         |
+| --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `Telegram API error 400: Bad Request: chat not found`                       | Wrong ID, or the bot has never had access to that chat                                                                |
+| `Telegram API error 403: Forbidden: bot was blocked by the user`            | The user blocked the bot                                                                                              |
+| `Rate limited by Telegram; retry after N seconds`                           | Not delivered; safe to retry after N seconds                                                                          |
+| `Telegram did not respond within 10000 ms; delivery could not be confirmed` | Still failing after all retries; may or may not have been delivered                                                   |
+| `Could not reach Telegram (ECONNRESET); delivery could not be confirmed`    | Network failure that outlasted the retries, with the error code when there is one; may or may not have been delivered |
+| `Attachment 2 ("top.txt"): <one of the errors above>`                       | The message and the files before this one were delivered; later files were not attempted                              |
 
 ### Delivery behaviour
 
@@ -347,9 +374,12 @@ Built-in safeguards:
 ```text
 src/
 ├── main.ts                          # bootstrap: reads PORT and starts the server
-├── app.module.ts                    # configuration, rate limiter, global validation pipe
+├── app.module.ts                    # configuration, global validation pipe
 ├── config/
 │   └── env.validation.ts            # environment schema, validated at startup
+├── rate-limit/
+│   ├── rate-limit.module.ts         # per-IP rate limit for every route
+│   └── rate-limit-message.ts        # 429 message with the wait, e.g. "try again in 42 seconds"
 ├── logging/
 │   ├── error-file.logger.ts         # console logger that also writes the error log files
 │   ├── request-context.ts           # request IDs, shared with every log line of a request

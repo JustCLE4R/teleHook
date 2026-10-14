@@ -97,15 +97,19 @@ describe('TelegramService', () => {
       telegramResponse(200, { ok: true, result: { message_id: 42 } }),
     );
 
-    await expect(createService().sendMessage('123', 'hi')).resolves.toBe(42);
+    await expect(createService().sendMessage('123', 'hi')).resolves.toEqual({
+      messageId: 42,
+      failedAttempts: [],
+    });
   });
 
   it('resolves without an ID when Telegram does not return one', async () => {
     fetchMock.mockResolvedValue(telegramResponse(200, { ok: true }));
 
-    await expect(
-      createService().sendMessage('123', 'hi'),
-    ).resolves.toBeUndefined();
+    await expect(createService().sendMessage('123', 'hi')).resolves.toEqual({
+      messageId: undefined,
+      failedAttempts: [],
+    });
   });
 
   it('uploads a photo as multipart form data with the given options', async () => {
@@ -120,7 +124,7 @@ describe('TelegramService', () => {
         },
         { caption: 'cpu.png', replyToMessageId: 7, silent: true },
       ),
-    ).resolves.toBe(1);
+    ).resolves.toEqual({ messageId: 1, failedAttempts: [] });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
@@ -244,7 +248,10 @@ describe('TelegramService', () => {
       createService().sendMessage('123', 'hi'),
     ).rejects.toMatchObject({
       reason: 'network_error',
-      message: 'Could not reach Telegram; delivery could not be confirmed',
+      // The error code helps diagnose; the cause's message is never used,
+      // because it can contain the URL and with it the token.
+      message:
+        'Could not reach Telegram (ECONNREFUSED); delivery could not be confirmed',
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(
@@ -311,10 +318,16 @@ describe('TelegramService', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(1);
 
-      await expect(sending).resolves.toBe(1);
+      // The caller learns why the first attempt failed.
+      await expect(sending).resolves.toEqual({
+        messageId: 1,
+        failedAttempts: [
+          'Could not reach Telegram (ECONNRESET); delivery could not be confirmed',
+        ],
+      });
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(warn).toHaveBeenCalledWith(
-        'sendMessage failed (Could not reach Telegram; delivery could not be confirmed); retry 1 of 3 in 1000 ms',
+        'sendMessage failed (Could not reach Telegram (ECONNRESET); delivery could not be confirmed); retry 1 of 3 in 1000 ms',
       );
     });
 
@@ -329,7 +342,7 @@ describe('TelegramService', () => {
       const sending = createService(1_000, 3).sendMessage('123', 'hi');
       await vi.advanceTimersByTimeAsync(1_000);
 
-      await expect(sending).resolves.toBe(1);
+      await expect(sending).resolves.toMatchObject({ messageId: 1 });
     });
 
     it('doubles the wait for each retry, then reports the attempts', async () => {
@@ -340,7 +353,12 @@ describe('TelegramService', () => {
       ).rejects.toMatchObject({
         reason: 'network_error',
         message:
-          'Could not reach Telegram; delivery could not be confirmed (after 4 attempts)',
+          'Could not reach Telegram (ECONNRESET); delivery could not be confirmed (after 4 attempts)',
+        failedAttempts: [
+          'Could not reach Telegram (ECONNRESET); delivery could not be confirmed',
+          'Could not reach Telegram (ECONNRESET); delivery could not be confirmed',
+          'Could not reach Telegram (ECONNRESET); delivery could not be confirmed',
+        ],
       });
       await vi.advanceTimersByTimeAsync(1_000);
       expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -362,7 +380,7 @@ describe('TelegramService', () => {
       const sending = createService(1_000, 1).sendMessage('123', 'hi');
       await vi.advanceTimersByTimeAsync(1_000);
 
-      await expect(sending).resolves.toBe(1);
+      await expect(sending).resolves.toMatchObject({ messageId: 1 });
     });
 
     it('waits retry_after seconds when rate limited', async () => {
@@ -375,7 +393,7 @@ describe('TelegramService', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(1);
 
-      await expect(sending).resolves.toBe(1);
+      await expect(sending).resolves.toMatchObject({ messageId: 1 });
     });
 
     it('fails without waiting when retry_after is longer than 30 seconds', async () => {
@@ -399,7 +417,7 @@ describe('TelegramService', () => {
       const sending = createService(1_000, 3).sendDocument('123', report());
       await vi.advanceTimersByTimeAsync(1_000);
 
-      await expect(sending).resolves.toBe(1);
+      await expect(sending).resolves.toMatchObject({ messageId: 1 });
       expect(fetchMock).toHaveBeenCalledTimes(2);
       for (const [url, init] of fetchMock.mock.calls) {
         expect(url).toBe(`${BOT_URL}/sendDocument`);

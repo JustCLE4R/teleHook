@@ -7,6 +7,7 @@ import type { ConfigService } from '@nestjs/config';
 import type { Mock } from 'vitest';
 import type { EnvironmentVariables } from '../config/env.validation.js';
 import {
+  type SendResult,
   TelegramApiError,
   type TelegramService,
 } from '../telegram/telegram.service.js';
@@ -22,6 +23,11 @@ function attachment(filename: string, isPhoto = false): Attachment {
 }
 
 const MESSAGE_ID = 42;
+
+/** A delivery, after `failedAttempts` retried attempts. */
+function sent(messageId?: number, failedAttempts: string[] = []): SendResult {
+  return { messageId, failedAttempts };
+}
 
 describe('NotificationsService', () => {
   let sendMessage: Mock<TelegramService['sendMessage']>;
@@ -40,11 +46,13 @@ describe('NotificationsService', () => {
   beforeEach(() => {
     sendMessage = vi
       .fn<TelegramService['sendMessage']>()
-      .mockResolvedValue(MESSAGE_ID);
-    sendPhoto = vi.fn<TelegramService['sendPhoto']>().mockResolvedValue(43);
+      .mockResolvedValue(sent(MESSAGE_ID));
+    sendPhoto = vi
+      .fn<TelegramService['sendPhoto']>()
+      .mockResolvedValue(sent(43));
     sendDocument = vi
       .fn<TelegramService['sendDocument']>()
-      .mockResolvedValue(44);
+      .mockResolvedValue(sent(44));
     service = createService();
     vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
@@ -64,7 +72,9 @@ describe('NotificationsService', () => {
     // The first chat finishes last, so completion order differs from request order.
     sendMessage.mockImplementation(
       (chatId) =>
-        new Promise((resolve) => setTimeout(resolve, chatId === '1' ? 20 : 1)),
+        new Promise((resolve) =>
+          setTimeout(() => resolve(sent(1)), chatId === '1' ? 20 : 1),
+        ),
     );
 
     await expect(
@@ -89,6 +99,7 @@ describe('NotificationsService', () => {
           'Telegram API error 403: Forbidden: bot was blocked by the user',
         );
       }
+      return sent(1);
     });
 
     await expect(service.send(['1', '2', '3'], 'Hello')).resolves.toEqual({
@@ -176,6 +187,7 @@ describe('NotificationsService', () => {
       maxInFlight = Math.max(maxInFlight, inFlight);
       await new Promise((resolve) => setTimeout(resolve, 5));
       inFlight--;
+      return sent(1);
     });
 
     await expect(service.send(chatIds(12), 'Hello')).resolves.toMatchObject({
@@ -378,7 +390,7 @@ describe('NotificationsService', () => {
     });
 
     it('sends attachments without a reply when the message ID is unknown', async () => {
-      sendMessage.mockResolvedValue(undefined);
+      sendMessage.mockResolvedValue(sent());
 
       await service.send(['123'], 'CPU high', [
         attachment('a.txt'),
@@ -414,7 +426,7 @@ describe('NotificationsService', () => {
             'Telegram API error 400: Bad Request: file must be non-empty',
           );
         }
-        return 44;
+        return sent(44);
       });
 
       await expect(
@@ -466,6 +478,115 @@ describe('NotificationsService', () => {
         ],
       });
       expect(sendDocument).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('warnings', () => {
+    const RESET =
+      'Could not reach Telegram (ECONNRESET); delivery could not be confirmed';
+
+    it('reports attempts that failed before the message got through', async () => {
+      sendMessage.mockResolvedValue(sent(MESSAGE_ID, [RESET]));
+
+      await expect(service.send(['123'], 'CPU high')).resolves.toEqual({
+        total: 1,
+        sent: 1,
+        failed: 0,
+        results: [
+          {
+            chat_id: '123',
+            success: true,
+            warnings: [`Message: attempt 1 failed and was retried: ${RESET}`],
+          },
+        ],
+      });
+    });
+
+    it('names the attachment whose upload needed retries', async () => {
+      sendDocument.mockResolvedValue(sent(44, [RESET, RESET]));
+
+      await expect(
+        service.send(['123'], 'CPU high', [attachment('top.txt')]),
+      ).resolves.toMatchObject({
+        results: [
+          {
+            success: true,
+            warnings: [
+              `Attachment 1 ("top.txt"): attempt 1 failed and was retried: ${RESET}`,
+              `Attachment 1 ("top.txt"): attempt 2 failed and was retried: ${RESET}`,
+            ],
+          },
+        ],
+      });
+    });
+
+    it('reports a photo sent as a file', async () => {
+      sendPhoto.mockRejectedValue(
+        new TelegramApiError(
+          'rejected',
+          'Telegram API error 400: Bad Request: PHOTO_INVALID_DIMENSIONS',
+        ),
+      );
+
+      await expect(
+        service.send(['123'], 'Page broken', [attachment('page.png', true)]),
+      ).resolves.toMatchObject({
+        results: [
+          {
+            success: true,
+            warnings: [
+              'Attachment 1 ("page.png"): sent as a file because Telegram refused it as a photo: Telegram API error 400: Bad Request: PHOTO_INVALID_DIMENSIONS',
+            ],
+          },
+        ],
+      });
+    });
+
+    it('reports the attempts behind a final failure, and the text fallback', async () => {
+      sendDocument.mockRejectedValue(
+        new TelegramApiError(
+          'network_error',
+          `${RESET} (after 2 attempts)`,
+          undefined,
+          [RESET],
+        ),
+      );
+
+      await expect(
+        service.send(['123'], 'CPU high', [attachment('top.txt')]),
+      ).resolves.toEqual({
+        total: 1,
+        sent: 0,
+        failed: 1,
+        results: [
+          {
+            chat_id: '123',
+            success: false,
+            error: `Attachment 1 ("top.txt"): ${RESET} (after 2 attempts)`,
+            warnings: [
+              `Attachment 1 ("top.txt"): attempt 1 failed and was retried: ${RESET}`,
+              'Message: sent as text on its own because the file could not be delivered',
+            ],
+          },
+        ],
+      });
+    });
+
+    it('keeps the warnings of each chat separate', async () => {
+      sendMessage.mockImplementation(async (chatId) =>
+        chatId === '2' ? sent(1, [RESET]) : sent(1),
+      );
+
+      const summary = await service.send(['1', '2'], 'CPU high');
+
+      expect(summary.results).toEqual([
+        { chat_id: '1', success: true },
+        {
+          chat_id: '2',
+          success: true,
+          warnings: [`Message: attempt 1 failed and was retried: ${RESET}`],
+        },
+      ]);
     });
   });
 });

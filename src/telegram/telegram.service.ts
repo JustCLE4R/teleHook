@@ -27,10 +27,19 @@ export class TelegramApiError extends Error {
     readonly reason: TelegramFailureReason,
     message: string,
     readonly retryAfterSeconds?: number,
+    /** Why the earlier attempts failed, if this failure followed retries. */
+    readonly failedAttempts: readonly string[] = [],
   ) {
     super(message);
     this.name = 'TelegramApiError';
   }
+}
+
+/** A delivered message or file. */
+export interface SendResult {
+  messageId: number | undefined;
+  /** Why the attempts before the successful one failed, if any. */
+  failedAttempts: string[];
 }
 
 /** A file to upload. */
@@ -72,9 +81,10 @@ export class TelegramService {
 
   /**
    * Sends a plain-text message. Resolves with the new message's ID once
-   * Telegram confirms delivery and throws a TelegramApiError otherwise.
+   * Telegram confirms delivery, along with any attempts that failed first,
+   * and throws a TelegramApiError otherwise.
    */
-  sendMessage(chatId: string, text: string): Promise<number | undefined> {
+  sendMessage(chatId: string, text: string): Promise<SendResult> {
     return this.call('sendMessage', JSON.stringify({ chat_id: chatId, text }));
   }
 
@@ -86,7 +96,7 @@ export class TelegramService {
     chatId: string,
     file: TelegramFile,
     options: SendFileOptions = {},
-  ): Promise<number | undefined> {
+  ): Promise<SendResult> {
     return this.call('sendPhoto', fileForm(chatId, 'photo', file, options));
   }
 
@@ -95,7 +105,7 @@ export class TelegramService {
     chatId: string,
     file: TelegramFile,
     options: SendFileOptions = {},
-  ): Promise<number | undefined> {
+  ): Promise<SendResult> {
     return this.call(
       'sendDocument',
       fileForm(chatId, 'document', file, options),
@@ -112,16 +122,18 @@ export class TelegramService {
   private async call(
     method: string,
     body: string | FormData,
-  ): Promise<number | undefined> {
+  ): Promise<SendResult> {
+    const failedAttempts: string[] = [];
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.post(method, body);
+        return { messageId: await this.post(method, body), failedAttempts };
       } catch (error) {
         const delayMs =
           attempt <= this.maxRetries ? retryDelayMs(error, attempt) : undefined;
         if (delayMs === undefined) {
-          throw attempt > 1 ? withAttempts(error, attempt) : error;
+          throw attempt > 1 ? withAttempts(error, failedAttempts) : error;
         }
+        failedAttempts.push((error as Error).message);
         this.logger.warn(
           `${method} failed (${(error as Error).message}); retry ${attempt} of ${this.maxRetries} in ${delayMs} ms`,
         );
@@ -170,12 +182,13 @@ export class TelegramService {
         `Telegram did not respond within ${this.timeoutMs} ms; delivery could not be confirmed`,
       );
     }
-    // Log only the error code: fetch error messages can contain the request
-    // URL, and the URL contains the bot token.
-    this.logger.warn(`Request to Telegram failed: ${errorCode(error)}`);
+    // Only the error code is used: fetch error messages can contain the
+    // request URL, and the URL contains the bot token.
+    const code = errorCode(error);
+    this.logger.warn(`Request to Telegram failed: ${code ?? 'unknown error'}`);
     return new TelegramApiError(
       'network_error',
-      'Could not reach Telegram; delivery could not be confirmed',
+      `Could not reach Telegram${code === undefined ? '' : ` (${code})`}; delivery could not be confirmed`,
     );
   }
 }
@@ -283,12 +296,16 @@ function retryDelayMs(error: unknown, attempt: number): number | undefined {
 }
 
 /** Notes in the message that the final failure followed retries. */
-function withAttempts(error: unknown, attempts: number): unknown {
+function withAttempts(
+  error: unknown,
+  failedAttempts: readonly string[],
+): unknown {
   return error instanceof TelegramApiError
     ? new TelegramApiError(
         error.reason,
-        `${error.message} (after ${attempts} attempts)`,
+        `${error.message} (after ${failedAttempts.length + 1} attempts)`,
         error.retryAfterSeconds,
+        failedAttempts,
       )
     : error;
 }
@@ -306,12 +323,10 @@ function parseTelegramResponse(raw: string): TelegramApiResponse | undefined {
   }
 }
 
-function errorCode(error: unknown): string {
+/** The system or undici error code, such as ECONNRESET, if there is one. */
+function errorCode(error: unknown): string | undefined {
   const cause = (error as { cause?: { code?: unknown } } | undefined)?.cause;
-  if (typeof cause?.code === 'string') {
-    return cause.code;
-  }
-  return error instanceof Error ? error.name : 'unknown error';
+  return typeof cause?.code === 'string' ? cause.code : undefined;
 }
 
 function sleep(ms: number): Promise<void> {

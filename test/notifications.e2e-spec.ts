@@ -247,14 +247,35 @@ describe('POST /api/send (e2e)', () => {
     });
   });
 
-  it('retries a dropped connection and delivers', async () => {
+  it('retries a dropped connection, delivers, and reports the retry', async () => {
     vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const reset = Object.assign(new Error('read ECONNRESET'), {
+      code: 'ECONNRESET',
+    });
     fetchMock
-      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockRejectedValueOnce(new TypeError('fetch failed', { cause: reset }))
       .mockImplementation(async () => delivered());
 
-    await post({ chat_ids: ['1'], message: 'Hello' }).expect(200);
+    const res = await post({ chat_ids: ['1'], message: 'Hello' }).expect(200);
 
+    expect(res.body).toEqual({
+      success: true,
+      message: 'Notification processing completed',
+      data: {
+        total: 1,
+        sent: 1,
+        failed: 0,
+        results: [
+          {
+            chat_id: '1',
+            success: true,
+            warnings: [
+              'Message: attempt 1 failed and was retried: Could not reach Telegram (ECONNRESET); delivery could not be confirmed',
+            ],
+          },
+        ],
+      },
+    });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -277,12 +298,18 @@ describe('POST /api/send (e2e)', () => {
         success: false,
         error:
           'Could not reach Telegram; delivery could not be confirmed (after 2 attempts)',
+        warnings: [
+          'Message: attempt 1 failed and was retried: Could not reach Telegram; delivery could not be confirmed',
+        ],
       },
       {
         chat_id: '2',
         success: false,
         error:
           'Telegram did not respond within 1000 ms; delivery could not be confirmed (after 2 attempts)',
+        warnings: [
+          'Message: attempt 1 failed and was retried: Telegram did not respond within 1000 ms; delivery could not be confirmed',
+        ],
       },
     ]);
     // One retry each, as configured in vitest.config.e2e.ts.
@@ -864,8 +891,15 @@ describe('POST /api/send (e2e)', () => {
 
     const res = await post(body).expect(429);
 
-    expect(res.body.message).toBe('Too many requests, please try again later');
-    expect(res.headers['retry-after']).toBeDefined();
+    // The window is 60 seconds in vitest.config.e2e.ts.
+    const retryAfter = Number(res.headers['retry-after']);
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+    expect(res.body.message).toBe(
+      retryAfter === 60
+        ? 'Too many requests, please try again in 1 minute'
+        : `Too many requests, please try again in ${retryAfter} seconds`,
+    );
     expect(fetchMock).toHaveBeenCalledTimes(RATE_LIMIT);
   });
 });
