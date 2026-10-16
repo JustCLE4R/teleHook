@@ -1,0 +1,13 @@
+[Unit]
+Description=telehook-watch: check this server and alert through teleHook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/telehook-watch.sh check
+# Root reads every log and journal; use a dedicated user in the adm and
+# systemd-journal groups instead if you prefer.
+User=root
+TimeoutStartSec=10min
+Nice=10

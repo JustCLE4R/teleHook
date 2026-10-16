@@ -1,0 +1,23 @@
+# Runs the teleHook API itself. Assumes the project is in /opt/telehook, built
+# with `npm ci && npm run build`, with its .env there, run as user "telehook".
+[Unit]
+Description=teleHook: Telegram alert API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telehook
+WorkingDirectory=/opt/telehook
+ExecStart=/usr/bin/node dist/main.js
+Restart=on-failure
+RestartSec=5
+# The error log goes to /opt/telehook/logs (ERROR_LOG_DIR=logs).
+ReadWritePaths=/opt/telehook/logs
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

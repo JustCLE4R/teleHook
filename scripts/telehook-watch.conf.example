@@ -1,0 +1,42 @@
+# telehook-watch settings. Install as /etc/telehook-watch.conf (chmod 600 if
+# TELEHOOK_HEADER holds credentials). This file is sourced by bash, so use
+# shell syntax: NAME="value", no spaces around "=".
+
+# Required. Your teleHook endpoint and the chats to alert.
+TELEHOOK_URL="https://telehook.example.com/api/send"
+TELEHOOK_CHAT_IDS="123456789,-1001234567890"
+
+# If a reverse proxy in front of teleHook requires authentication:
+# TELEHOOK_HEADER="Authorization: Basic dXNlcjpwYXNzd29yZA=="
+
+# Name shown in alerts (default: hostname).
+# HOST_LABEL="web-1 (production)"
+
+# ---- checks (empty lists disable a check) ----
+# Alert when a filesystem is at least this full.
+DISK_MAX_PERCENT=90
+# Alert when less than this share of memory is available.
+MEM_MIN_AVAILABLE_PERCENT=10
+# Alert when the 5-minute load average per CPU is above this.
+LOAD_MAX_PER_CPU=2.0
+# systemd units that must be active, separated by spaces.
+SERVICES="nginx docker"
+# URLs that must answer 2xx or 3xx, separated by spaces.
+URLS="https://example.com/health"
+URL_TIMEOUT=10
+
+# ---- attachments ----
+# Logs whose last LOG_LINES lines are attached to alerts.
+LOG_FILES="/var/log/nginx/error.log /var/log/syslog"
+LOG_LINES=200
+# Keep these within the teleHook server's MAX_ATTACHMENTS_PER_REQUEST and
+# MAX_ATTACHMENT_SIZE_MB (defaults 5 files and 10 MB).
+MAX_FILES=5
+MAX_FILE_BYTES=9437184
+
+# ---- alert behaviour ----
+# Repeat an alert for a problem that lasts, every this many minutes.
+REPEAT_MINUTES=60
+# 1: send a message when a problem is fixed.
+NOTIFY_RESOLVED=1
+STATE_DIR=/var/lib/telehook-watch
